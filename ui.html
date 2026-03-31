@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Site X-Ray</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+:root { --bg:#0a0a0a; --s:#141414; --s2:#1a1a1a; --b:#262626; --t:#fafafa; --t2:#a0a0a0; --a:#00ff88; --f:"SF Mono","Fira Code",Menlo,monospace; }
+body { background:var(--bg); color:var(--t); font-family:var(--f); padding:40px 20px; max-width:700px; margin:0 auto; }
+h1 { font-size:22px; margin-bottom:4px; }
+h1 span { color:var(--a); }
+.sub { font-size:12px; color:var(--t2); margin-bottom:30px; }
+.row { display:flex; gap:8px; margin-bottom:16px; }
+input,select { padding:10px 14px; font-size:13px; background:var(--s); border:1px solid var(--b); border-radius:6px; color:var(--t); font-family:var(--f); outline:none; }
+input:focus,select:focus { border-color:var(--a); }
+input { flex:1; }
+button { padding:10px 20px; font-size:13px; font-weight:600; background:var(--a); color:var(--bg); border:none; border-radius:6px; cursor:pointer; font-family:var(--f); }
+button:hover { opacity:0.9; }
+button:disabled { background:var(--s2); color:var(--t2); cursor:wait; }
+#log { background:var(--s); border:1px solid var(--b); border-radius:8px; padding:16px; min-height:300px; max-height:500px; overflow-y:auto; font-size:12px; line-height:1.8; white-space:pre-wrap; }
+.ok { color:var(--a); }
+.err { color:#ff4444; }
+.dim { color:var(--t2); }
+#result { margin-top:16px; padding:16px; background:var(--s); border:1px solid var(--a); border-radius:8px; display:none; }
+#result .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin:12px 0; }
+#result .stat { padding:8px; background:var(--s2); border-radius:6px; text-align:center; }
+#result .stat b { display:block; font-size:18px; }
+#result .stat small { font-size:10px; color:var(--t2); }
+#open { display:block; padding:10px; text-align:center; background:var(--a); color:var(--bg); border-radius:6px; font-weight:700; font-size:13px; text-decoration:none; cursor:pointer; border:none; width:100%; font-family:var(--f); }
+.foot { margin-top:40px; font-size:11px; color:var(--t2); text-align:center; }
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:var(--b);border-radius:4px}
+</style>
+</head>
+<body>
+<h1><span>&gt;</span> Site X-Ray</h1>
+<p class="sub">Paste a URL. Hit Clone. Done.</p>
+
+<div class="row">
+  <input id="url" type="url" placeholder="https://example.com" autofocus>
+  <select id="pages"><option value="1">1p</option><option value="5">5p</option><option value="10">10p</option><option value="20">20p</option></select>
+  <button id="go" onclick="run()">Clone</button>
+</div>
+
+<div id="log"><span class="dim">Ready. Paste a URL and click Clone.</span></div>
+
+<div id="result">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <span class="ok" style="font-weight:600">Clone Ready</span>
+    <span id="size" class="dim"></span>
+  </div>
+  <div class="stats">
+    <div class="stat"><b id="rPages">0</b><small>Pages</small></div>
+    <div class="stat"><b id="rImages">0</b><small>Images</small></div>
+    <div class="stat"><b id="rFonts">0</b><small>Fonts</small></div>
+    <div class="stat"><b id="rVideos">0</b><small>Videos</small></div>
+  </div>
+  <button id="open" onclick="openClone()">Open Clone</button>
+</div>
+
+<p class="foot">allone.ge — rendering pipeline level</p>
+
+<script>
+let outDir = '';
+
+function log(text, cls) {
+  const el = document.getElementById('log');
+  const t = new Date().toLocaleTimeString('en',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  el.innerHTML += `<div><span class="dim">${t}</span> <span class="${cls||''}">${text}</span></div>`;
+  el.scrollTop = el.scrollHeight;
+}
+
+async function run() {
+  const url = document.getElementById('url').value.trim();
+  if (!url) return;
+  const pages = document.getElementById('pages').value;
+
+  document.getElementById('log').innerHTML = '';
+  document.getElementById('result').style.display = 'none';
+  document.getElementById('go').disabled = true;
+
+  log(`X-Ray: ${url} (${pages} pages)`);
+
+  try {
+    const slug = new URL(url).hostname.replace(/\./g,'-');
+    outDir = `/tmp/clone-${slug}`;
+
+    log('Launching...');
+
+    const res = await fetch(`http://localhost:3099/run`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({url, pages, outDir}),
+    });
+
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      dec.decode(value).split('\n').filter(Boolean).forEach(line => {
+        if (line.includes('✅')) log(line, 'ok');
+        else if (line.includes('❌')) log(line, 'err');
+        else log(line);
+
+        // Parse result
+        const pm = line.match(/(\d+) images, (\d+) fonts?, (\d+) videos?/);
+        if (pm) {
+          document.getElementById('rImages').textContent = pm[1];
+          document.getElementById('rFonts').textContent = pm[2];
+          document.getElementById('rVideos').textContent = pm[3];
+        }
+        const pgm = line.match(/(\d+) pages/);
+        if (pgm) document.getElementById('rPages').textContent = pgm[1];
+        const sm = line.match(/([\d.]+)MB/);
+        if (sm) document.getElementById('size').textContent = sm[1] + 'MB';
+      });
+    }
+
+    log('Done!', 'ok');
+    document.getElementById('result').style.display = 'block';
+  } catch(e) {
+    log('Error: ' + e.message, 'err');
+    log('Is the local server running? Start it with:', 'dim');
+    log('  node ~/projects/site-xray/server.js', 'dim');
+  }
+
+  document.getElementById('go').disabled = false;
+}
+
+function openClone() {
+  window.open(`http://localhost:3098`);
+}
+
+document.getElementById('url').addEventListener('keydown', e => {
+  if (e.key === 'Enter') run();
+});
+</script>
+</body>
+</html>

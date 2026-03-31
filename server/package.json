@@ -1,0 +1,11 @@
+{
+  "name": "site-xray-server",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "playwright": "^1.57.0"
+  }
+}
