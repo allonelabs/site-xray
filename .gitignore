@@ -1,0 +1,13 @@
+
+# project-specific cloning helpers (not part of cloner core)
+kenkais-*.js
+discover-kenkais.js
+discover.js
+discover2.js
+probe.js
+probe2.js
+probe3.js
+probe4.js
+network-trace.js
+ssscript-clone/
+cactus-clone/

@@ -1,0 +1,25 @@
+{
+  "active": [
+    { "url": "https://linear.app", "category": "nextjs", "difficulty": "medium", "pages": 3 },
+    { "url": "https://cuberto.com", "category": "webflow", "difficulty": "medium", "pages": 3 },
+    { "url": "https://vercel.com", "category": "nextjs", "difficulty": "medium", "pages": 3 },
+    { "url": "https://www.morganlewis.com", "category": "corporate", "difficulty": "medium", "pages": 5 },
+    { "url": "https://pentagram.com", "category": "portfolio", "difficulty": "medium", "pages": 3 },
+    { "url": "https://stripe.com", "category": "heavy-js", "difficulty": "hard", "pages": 2 },
+    { "url": "https://www.cravath.com", "category": "corporate", "difficulty": "easy", "pages": 3 },
+    { "url": "https://www.roomshotels.com", "category": "hospitality", "difficulty": "medium", "pages": 3 }
+  ],
+  "mastered": [],
+  "queue": [
+    { "url": "https://www.awwwards.com", "category": "heavy-js", "difficulty": "hard", "pages": 3 },
+    { "url": "https://www.apple.com", "category": "corporate", "difficulty": "hard", "pages": 3 },
+    { "url": "https://notion.so", "category": "nextjs", "difficulty": "hard", "pages": 3 },
+    { "url": "https://lusion.co", "category": "webgl", "difficulty": "extreme", "pages": 2 },
+    { "url": "https://www.shopify.com", "category": "ecommerce", "difficulty": "hard", "pages": 3 },
+    { "url": "https://resn.co.nz", "category": "webgl", "difficulty": "extreme", "pages": 2 },
+    { "url": "https://www.tesla.com", "category": "corporate", "difficulty": "hard", "pages": 3 },
+    { "url": "https://basement.studio", "category": "creative-agency", "difficulty": "hard", "pages": 3 },
+    { "url": "https://www.freezpak.com", "category": "lottie-scroll", "difficulty": "hard", "pages": 2 },
+    { "url": "https://www.locomotive.ca", "category": "creative-agency", "difficulty": "medium", "pages": 3 }
+  ]
+}
