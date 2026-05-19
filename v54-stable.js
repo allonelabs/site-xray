@@ -105,6 +105,10 @@ Examples:
 }
 
 const PARSED = new URL(TARGET);
+if (!["http:", "https:"].includes(PARSED.protocol)) {
+  console.error("Error: Only http:// and https:// URLs are supported.");
+  process.exit(1);
+}
 const DOMAIN = PARSED.origin;
 const OUT =
   positional[1] || `/tmp/clone-${PARSED.hostname.replace(/\./g, "-")}`;
@@ -120,6 +124,17 @@ const ALT_DOMAIN = (() => {
 // Shared state
 const urlMap = {};
 const networkURLs = new Set();
+const MAX_NETWORK_URLS = 5000; // v53 backport: cap to prevent unbounded memory
+// v53 backport: Error capture for silent failure diagnostics
+const captureErrors = [];
+function logCaptureError(context, error) {
+  const msg = error?.message || String(error);
+  captureErrors.push({
+    context,
+    error: msg.slice(0, 200),
+    timestamp: new Date().toISOString(),
+  });
+}
 const crawled = new Set();
 const queue = [PARSED.pathname || "/"];
 // v52+: any explicit --passcode <route> seeds the queue too — these routes
@@ -146,6 +161,11 @@ function dl(url, dest, timeout = 15000, _depth = 0) {
       if (!url || url.startsWith("data:") || url.startsWith("blob:"))
         return resolve(false);
       if (_depth > 5) return resolve(false); // v20: prevent infinite redirect loops
+      const resolvedDest = path.resolve(dest);
+      if (!resolvedDest.startsWith(path.resolve(OUT))) {
+        console.warn(`  ⚠ Path traversal blocked in dl(): ${dest}`);
+        return resolve(false);
+      }
       fs.mkdirSync(path.dirname(dest), { recursive: true });
       const file = fs.createWriteStream(dest);
       const client = url.startsWith("https") ? https : http;
@@ -229,6 +249,28 @@ function mapAsset(orig, local) {
   } catch (e) {}
 }
 
+// v53 backport: Path traversal protection
+function safePath(filePath) {
+  const resolved = path.resolve(OUT, filePath.replace(/^\//, ""));
+  if (!resolved.startsWith(path.resolve(OUT))) {
+    console.warn(`  ⚠ Path traversal blocked: ${filePath}`);
+    return null;
+  }
+  return resolved;
+}
+
+// v53 backport: Single-pass URL rewriting (replaces per-key regex loop)
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function rewriteURLs(text, map) {
+  const keys = Object.keys(map);
+  if (keys.length === 0) return text;
+  keys.sort((a, b) => b.length - a.length);
+  const pattern = new RegExp(keys.map(escapeRegExp).join("|"), "g");
+  return text.replace(pattern, (match) => map[match] || match);
+}
+
 function pathToFile(p) {
   p = p || "/";
   if (p.endsWith("/")) p += "index.html";
@@ -247,6 +289,32 @@ function pathToFile(p) {
     }
   }
   return parts.join("/");
+}
+
+// v53 backport: Parallel asset downloads with concurrency limit
+async function downloadBatch(urls, outDir, prefix, defaultExt, limit = 8) {
+  let count = 0;
+  const items = [...urls];
+  for (let i = 0; i < items.length; i += limit) {
+    const batch = items.slice(i, i + limit);
+    const promises = batch.map(async (url) => {
+      try {
+        const a = new URL(url, DOMAIN).href;
+        if (urlMap[a]) return;
+        const ext =
+          path.extname(new URL(a).pathname).split("?")[0] || defaultExt;
+        const nm = `${prefix}-${count}${ext}`;
+        count++;
+        if (await dl(a, `${outDir}/${nm}`)) {
+          mapAsset(url, `/${path.basename(outDir)}/${nm}`);
+        }
+      } catch (e) {
+        logCaptureError(`downloadBatch-${prefix}`, e);
+      }
+    });
+    await Promise.all(promises);
+  }
+  return count;
 }
 
 // ═══════════════════════════════════════
@@ -2807,14 +2875,7 @@ async function capturePage(page, urlPath, isFirst) {
   const sorted = Object.entries(urlMap).sort(
     (a, b) => b[0].length - a[0].length,
   );
-  for (const [orig, local] of sorted) {
-    try {
-      html = html.replace(
-        new RegExp(orig.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"),
-        local,
-      );
-    } catch (e) {}
-  }
+  html = rewriteURLs(html, urlMap);
 
   // v11: Fallback — rewrite remaining unmatched src/href/url() by filename matching
   // This catches URLs with query params, CDN prefixes, etc. that weren't mapped exactly
@@ -2875,14 +2936,7 @@ async function capturePage(page, urlPath, isFirst) {
 
   // Rewrite CSS asset URLs too
   let css = sharedCSS;
-  for (const [orig, local] of sorted) {
-    try {
-      css = css.replace(
-        new RegExp(orig.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"),
-        local,
-      );
-    } catch (e) {}
-  }
+  css = rewriteURLs(css, urlMap);
   // v16: Rewrite ALL asset URLs in CSS by filename matching (fonts + images)
   css = css.replace(
     /url\(["']?([^"')]+\.(?:woff2?|ttf|otf|eot|jpg|jpeg|png|gif|webp|svg|avif)[^"')]*?)["']?\)/gi,
@@ -3952,7 +4006,8 @@ async function main() {
   let page = await context.newPage();
   page.on("response", async (res) => {
     try {
-      if (res.status() === 200) networkURLs.add(res.url());
+      if (res.status() === 200 && networkURLs.size < MAX_NETWORK_URLS)
+        networkURLs.add(res.url());
     } catch (e) {}
   });
 
@@ -3985,7 +4040,8 @@ async function main() {
       page = await context.newPage();
       page.on("response", async (res) => {
         try {
-          if (res.status() === 200) networkURLs.add(res.url());
+          if (res.status() === 200 && networkURLs.size < MAX_NETWORK_URLS)
+            networkURLs.add(res.url());
         } catch (e) {}
       });
       n++; // Count it so we don't get stuck
@@ -4043,7 +4099,8 @@ async function main() {
       const cleanPage = await cleanCtx.newPage();
       cleanPage.on("response", async (res) => {
         try {
-          if (res.status() === 200) networkURLs.add(res.url());
+          if (res.status() === 200 && networkURLs.size < MAX_NETWORK_URLS)
+            networkURLs.add(res.url());
         } catch (e) {}
       });
 
@@ -4202,14 +4259,7 @@ async function main() {
         const sorted = Object.entries(urlMap).sort(
           (a, b) => b[0].length - a[0].length,
         );
-        for (const [orig, local] of sorted) {
-          try {
-            cleanHTML = cleanHTML.replace(
-              new RegExp(orig.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"),
-              local,
-            );
-          } catch (e) {}
-        }
+        cleanHTML = rewriteURLs(cleanHTML, urlMap);
         cleanHTML = cleanHTML.split(DOMAIN + "/").join("/");
         cleanHTML = cleanHTML.split(DOMAIN + '"').join('/"');
         cleanHTML = cleanHTML.split(ALT_DOMAIN + "/").join("/");
@@ -4217,14 +4267,7 @@ async function main() {
 
         // Rewrite CSS URLs
         let css = sharedCSS;
-        for (const [orig, local] of sorted) {
-          try {
-            css = css.replace(
-              new RegExp(orig.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"),
-              local,
-            );
-          } catch (e) {}
-        }
+        css = rewriteURLs(css, urlMap);
         css = css.split(DOMAIN + "/").join("/");
         css = css.split(ALT_DOMAIN + "/").join("/");
 
@@ -5035,8 +5078,7 @@ ${stubFooter || ""}
   const totalSize =
     parseInt(
       require("child_process")
-        .execSync(`du -sk "${OUT}" 2>/dev/null`)
-        .toString()
+        .execFileSync("du", ["-sk", OUT], { encoding: "utf-8" })
         .split("\t")[0],
     ) || 0;
 
