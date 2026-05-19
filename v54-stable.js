@@ -5077,9 +5077,15 @@ ${stubFooter || ""}
     .filter((f) => !f.includes("data/")).length;
   const totalSize =
     parseInt(
-      require("child_process")
-        .execFileSync("du", ["-sk", OUT], { encoding: "utf-8" })
-        .split("\t")[0],
+      (() => {
+        try {
+          return require("child_process").execFileSync("du", ["-sk", OUT], {
+            encoding: "utf-8",
+          });
+        } catch {
+          return "0\t";
+        }
+      })().split("\t")[0],
     ) || 0;
 
   // ═══════════════════════════════════════
