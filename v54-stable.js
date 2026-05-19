@@ -5174,6 +5174,100 @@ ${stubFooter || ""}
     console.log(`     📸 Screenshots: data/original.png vs data/clone.png`);
   }
 
+  // v53 backport: Write capture errors log
+  if (captureErrors.length > 0) {
+    fs.writeFileSync(
+      path.join(OUT, "data", "errors.json"),
+      JSON.stringify(captureErrors, null, 2),
+    );
+    console.log(
+      `     ⚠ ${captureErrors.length} capture errors logged to data/errors.json`,
+    );
+  }
+
+  // v53 backport: Structured manifest (will be extended by v54 verify phase)
+  try {
+    const manifest = {
+      version: "v54",
+      url: TARGET,
+      domain: DOMAIN,
+      crawledAt: new Date().toISOString(),
+      pages: [...crawled],
+      pageCount: crawled.size,
+      assets: {
+        images: imgC,
+        fonts: fontC,
+        videos: vidC,
+        models: modelC,
+        shaders: shaderC,
+      },
+      totalFiles: totalFiles,
+      totalSizeKB: totalSize,
+      issues: issues,
+      metadata: {},
+      passes: [], // v54: populated by verify+fix loop
+      finalStatus: "not-verified", // v54: updated by loop
+      unfixableIssues: [], // v54
+    };
+
+    try {
+      const idx = fs.readFileSync(path.join(OUT, "index.html"), "utf-8");
+      const titleMatch = idx.match(/<title>([^<]+)<\/title>/i);
+      const descMatch = idx.match(
+        /meta[^>]*name="description"[^>]*content="([^"]+)"/i,
+      );
+      const ogImgMatch = idx.match(
+        /meta[^>]*property="og:image"[^>]*content="([^"]+)"/i,
+      );
+      manifest.metadata = {
+        title: titleMatch?.[1] || "",
+        description: descMatch?.[1] || "",
+        ogImage: ogImgMatch?.[1] || "",
+      };
+    } catch {}
+
+    fs.writeFileSync(
+      path.join(OUT, "data", "manifest.json"),
+      JSON.stringify(manifest, null, 2),
+    );
+    console.log(`     📋 Manifest: data/manifest.json`);
+  } catch (mErr) {
+    console.log(
+      `     ⚠ Manifest generation failed: ${mErr.message?.slice(0, 60)}`,
+    );
+  }
+
+  // v53 backport: Responsive capture
+  if (flags.responsive) {
+    console.log("\n  📐 Responsive capture...");
+    const viewports = [
+      { width: 1440, height: 900, name: "desktop" },
+      { width: 768, height: 1024, name: "tablet" },
+      { width: 375, height: 812, name: "mobile" },
+    ];
+    const respPage = await context.newPage();
+    for (const vp of viewports) {
+      try {
+        await respPage.setViewportSize({ width: vp.width, height: vp.height });
+        await respPage
+          .goto(DOMAIN, { waitUntil: "networkidle", timeout: 20000 })
+          .catch(() => {});
+        await dismissOverlays(respPage);
+        await respPage.waitForTimeout(1500);
+        const respPath = path.join(OUT, "data", `responsive-${vp.name}.png`);
+        await respPage.screenshot({ path: respPath, fullPage: false });
+        console.log(
+          `     ${vp.name} (${vp.width}px): data/responsive-${vp.name}.png`,
+        );
+      } catch (e) {
+        console.log(
+          `     ⚠ ${vp.name} capture failed: ${e.message?.slice(0, 60)}`,
+        );
+      }
+    }
+    await respPage.close();
+  }
+
   console.log(`\n✅ Clone ready — ${n} pages`);
   console.log(
     `   ${imgC} images, ${fontC} fonts, ${vidC} videos, ${shaderC} shaders, ${modelC} 3D models`,
