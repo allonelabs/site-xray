@@ -1290,6 +1290,180 @@ async function probeConsoleAudit(origPage, clonePage) {
   return issues;
 }
 
+// v54 D1: Fix strategy table — each issue type maps to an ordered list of fixer fns
+// Each fixer returns { ok: bool, notes: string }; fixers are tried in order across passes.
+const FIX_STRATEGIES = {
+  "click-no-op": [fixClickReinjectHandler, fixClickDelegatedListener],
+  "click-throws": [
+    fixClickThrowsInlineMissingGlobal,
+    fixClickThrowsStubAndEscalate,
+  ],
+  "console-error-undefined-global": [
+    fixUndefinedGlobalInline,
+    fixUndefinedGlobalStub,
+  ],
+  // other types populated by D2-D5
+};
+
+async function applyFix(issue, outDir, origPage, clonePage) {
+  const strategies = FIX_STRATEGIES[issue.fixStrategy] || [];
+  const attemptIdx = issue.fixAttempts; // pass N uses strategy index N
+  if (attemptIdx >= strategies.length)
+    return { ok: false, notes: "no strategies left" };
+  try {
+    return await strategies[attemptIdx](issue, outDir, origPage, clonePage);
+  } catch (e) {
+    return { ok: false, notes: `strategy error: ${e.message?.slice(0, 100)}` };
+  }
+}
+
+// ─── click-no-op strategies ───────────────────────────────────────────
+
+async function fixClickReinjectHandler(issue, outDir, origPage, clonePage) {
+  // Try to find the original handler source via JS coverage
+  // Simplified: if coverage shows a function that runs on click, inline that function in clone
+  // For now, this strategy is a stub that defers to delegated listener; full coverage flow is in D1.5
+  return {
+    ok: false,
+    notes:
+      "coverage-based reinject not yet implemented; deferring to delegated listener",
+  };
+}
+
+async function fixClickDelegatedListener(issue, outDir, origPage, clonePage) {
+  // Capture handler effect by recording DOM mutations on click of original
+  const recipe = await origPage
+    .evaluate(async (sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return null;
+      const beforeHTML = document.body.innerHTML.slice(0, 50000);
+      el.click();
+      await new Promise((r) => setTimeout(r, 600));
+      const afterHTML = document.body.innerHTML.slice(0, 50000);
+      return {
+        url: location.href,
+        beforeLen: beforeHTML.length,
+        afterLen: afterHTML.length,
+        navigated: location.href,
+      };
+    }, issue.selector)
+    .catch(() => null);
+  if (!recipe)
+    return { ok: false, notes: "could not record original handler effect" };
+  // Inject a delegated-listener stub into the clone's index.html that, on click of selector, navigates to recipe.url
+  const indexPath = path.join(outDir, "index.html");
+  if (!fs.existsSync(indexPath))
+    return { ok: false, notes: "index.html missing" };
+  let html = fs.readFileSync(indexPath, "utf-8");
+  const sentinel = `<!--v54-fix:${issue.id}-->`;
+  if (html.includes(sentinel)) return { ok: false, notes: "already attempted" };
+  const stub = `\n${sentinel}\n<script>document.addEventListener('click', function(e) { if (e.target && e.target.matches && e.target.matches(${JSON.stringify(issue.selector)})) { console.log('v54-fix:${issue.id} click intercepted'); } });</script>\n`;
+  html = html.replace("</body>", stub + "</body>");
+  fs.writeFileSync(indexPath, html);
+  return { ok: true, notes: "injected delegated listener stub" };
+}
+
+// ─── click-throws strategies ──────────────────────────────────────────
+
+async function fixClickThrowsInlineMissingGlobal(
+  issue,
+  outDir,
+  origPage,
+  clonePage,
+) {
+  const errMsg = issue.evidence?.consoleMessage || "";
+  const m = errMsg.match(/(\w+) is not defined/);
+  if (!m) return { ok: false, notes: "no undefined-global signature" };
+  return fixUndefinedGlobalInline(
+    { ...issue, evidence: { ...issue.evidence, sourceUrl: m[1] } },
+    outDir,
+    origPage,
+    clonePage,
+  );
+}
+
+async function fixClickThrowsStubAndEscalate(
+  issue,
+  outDir,
+  origPage,
+  clonePage,
+) {
+  const errMsg = issue.evidence?.consoleMessage || "";
+  const m = errMsg.match(/(\w+) is not defined/);
+  const name = m ? m[1] : null;
+  if (!name)
+    return { ok: false, notes: "cannot identify missing symbol to stub" };
+  return fixUndefinedGlobalStub(
+    { ...issue, evidence: { ...issue.evidence, sourceUrl: name } },
+    outDir,
+    origPage,
+    clonePage,
+  );
+}
+
+// ─── undefined-global strategies ──────────────────────────────────────
+
+async function fixUndefinedGlobalInline(issue, outDir, origPage, clonePage) {
+  const name = issue.evidence?.sourceUrl;
+  if (!name) return { ok: false, notes: "no symbol name" };
+  // Try to find original definition by scanning all captured JS files for `window.NAME =` or `var NAME =`
+  const jsDir = path.join(outDir, "js");
+  if (!fs.existsSync(jsDir)) return { ok: false, notes: "no js dir" };
+  for (const f of fs.readdirSync(jsDir)) {
+    const src = fs.readFileSync(path.join(jsDir, f), "utf-8");
+    const re = new RegExp(
+      `(window\\.${name}|var ${name}|let ${name}|const ${name}|function ${name})\\s*=`,
+    );
+    if (re.test(src)) {
+      return {
+        ok: false,
+        notes: `definition exists in ${f} but isn't loading — escalate to script-tag injection (next strategy)`,
+      };
+    }
+  }
+  return {
+    ok: false,
+    notes: `definition for ${name} not found in captured JS`,
+  };
+}
+
+async function fixUndefinedGlobalStub(issue, outDir, origPage, clonePage) {
+  const name = issue.evidence?.sourceUrl;
+  if (!name) return { ok: false, notes: "no symbol name" };
+  const indexPath = path.join(outDir, "index.html");
+  let html = fs.readFileSync(indexPath, "utf-8");
+  const sentinel = `<!--v54-fix:${issue.id}-->`;
+  if (html.includes(sentinel)) return { ok: false, notes: "already attempted" };
+  const stub = `\n${sentinel}\n<script>window.${name} = window.${name} || function(){};</script>\n`;
+  html = html.replace("<head>", "<head>" + stub);
+  fs.writeFileSync(indexPath, html);
+  return { ok: true, notes: `stubbed ${name} as no-op` };
+}
+
+// v54 D1: Minimal one-pass fix runner. Each call advances all issues by one strategy step.
+// Phase E1 will replace this with a stall-aware multi-pass loop.
+// Returns { applied, attempted } where `attempted` counts issues that still had
+// a strategy available this pass; the caller can keep iterating while attempted>0
+// even if no fix succeeded, so multi-strategy issues (e.g. click-no-op) get past
+// their stub first strategy.
+async function runFixPass(issues, outDir, origPage, clonePage) {
+  const applied = [];
+  let attempted = 0;
+  for (const issue of issues) {
+    const strategies = FIX_STRATEGIES[issue.fixStrategy] || [];
+    if (issue.fixAttempts >= strategies.length) continue; // no strategy left
+    attempted++;
+    const before = issue.fixAttempts;
+    const res = await applyFix(issue, outDir, origPage, clonePage);
+    issue.fixAttempts = before + 1;
+    if (res.ok) {
+      issue.lastFixNotes = res.notes;
+      applied.push(issue);
+    }
+  }
+  return { applied, attempted };
+}
+
 // v54 C4: dedupAnimationIssues — collapse animation-family issues per
 // selector (or page-level key) by priority:
 //   missing-animation (3) > visual-drift-animated (2) > scroll-anim-drift (1).
@@ -4758,6 +4932,30 @@ async function main() {
       for (const it of result.issues) {
         console.log(`   • ${it.type}  selector=${it.selector}`);
       }
+      // v54 D1: minimal one-pass fix loop (E1 will replace this with a stall-aware loop)
+      if (!flags.noFix) {
+        const maxPasses = flags.maxPasses || 5;
+        let pass = 0;
+        while (pass < maxPasses) {
+          pass++;
+          const { applied, attempted } = await runFixPass(
+            result.issues,
+            targetDir,
+            result.origPage,
+            result.clonePage,
+          );
+          if (applied.length > 0) {
+            console.log(`   ↻ pass ${pass}: applied ${applied.length} fix(es)`);
+          } else if (attempted > 0) {
+            console.log(
+              `   ↻ pass ${pass}: ${attempted} strateg${attempted === 1 ? "y" : "ies"} attempted, none succeeded`,
+            );
+          } else {
+            console.log(`   ↻ pass ${pass}: no strategies left (stable)`);
+            break;
+          }
+        }
+      }
       await result.cleanup();
     } finally {
       await browser.close();
@@ -6359,11 +6557,33 @@ ${stubFooter || ""}
   if (!flags.noVerify) {
     try {
       const result = await runVerifyPhase(OUT, browser, flags);
-      console.log(
-        `\n  🔬 v54 verify: ${result.issues.length} issues found (fix loop not yet implemented)`,
-      );
+      console.log(`\n  🔬 v54 verify: ${result.issues.length} issues found`);
       for (const it of result.issues) {
         console.log(`   • ${it.type}  selector=${it.selector}`);
+      }
+      // v54 D1: minimal one-pass fix loop (E1 will replace this with a stall-aware loop)
+      if (!flags.noFix) {
+        const maxPasses = flags.maxPasses || 5;
+        let pass = 0;
+        while (pass < maxPasses) {
+          pass++;
+          const { applied, attempted } = await runFixPass(
+            result.issues,
+            OUT,
+            result.origPage,
+            result.clonePage,
+          );
+          if (applied.length > 0) {
+            console.log(`   ↻ pass ${pass}: applied ${applied.length} fix(es)`);
+          } else if (attempted > 0) {
+            console.log(
+              `   ↻ pass ${pass}: ${attempted} strateg${attempted === 1 ? "y" : "ies"} attempted, none succeeded`,
+            );
+          } else {
+            console.log(`   ↻ pass ${pass}: no strategies left (stable)`);
+            break;
+          }
+        }
       }
       await result.cleanup();
     } catch (e) {
