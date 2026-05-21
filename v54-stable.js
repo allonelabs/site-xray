@@ -271,6 +271,21 @@ function rewriteURLs(text, map) {
   return text.replace(pattern, (match) => map[match] || match);
 }
 
+// v54: Issue schema helpers
+function issueId(type, selector, viewport) {
+  const key = `${type}|${selector || ""}|${viewport ? viewport.w + "x" + viewport.h : ""}`;
+  return crypto.createHash("sha1").update(key).digest("hex").slice(0, 8);
+}
+
+function writePassIssues(outDir, passNum, issues) {
+  const dir = path.join(outDir, "data", "passes");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, `pass-${passNum}.json`),
+    JSON.stringify(issues, null, 2),
+  );
+}
+
 function pathToFile(p) {
   p = p || "/";
   if (p.endsWith("/")) p += "index.html";

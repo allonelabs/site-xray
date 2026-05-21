@@ -1,6 +1,9 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const path = require("path");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
 
 const OUT = "/tmp/test-out";
 
@@ -44,4 +47,38 @@ test("rewriteURLs replaces longest match first", () => {
 
 test("rewriteURLs no-op on empty map", () => {
   assert.strictEqual(rewriteURLs("abc", {}), "abc");
+});
+
+function issueId(type, selector, viewport) {
+  const key = `${type}|${selector || ""}|${viewport ? viewport.w + "x" + viewport.h : ""}`;
+  return crypto.createHash("sha1").update(key).digest("hex").slice(0, 8);
+}
+
+test("issueId is stable for same inputs", () => {
+  const a = issueId("click-no-op", "button.cta", { w: 1440, h: 900 });
+  const b = issueId("click-no-op", "button.cta", { w: 1440, h: 900 });
+  assert.strictEqual(a, b);
+});
+
+test("issueId differs for different selectors", () => {
+  const a = issueId("click-no-op", "button.cta", null);
+  const b = issueId("click-no-op", "button.other", null);
+  assert.notStrictEqual(a, b);
+});
+
+test("writePassIssues serializes deterministically", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "v54-test-"));
+  fs.mkdirSync(path.join(dir, "data", "passes"), { recursive: true });
+  const issues = [
+    { id: "abc", type: "click-no-op", selector: "button", fixAttempts: 0 },
+  ];
+  fs.writeFileSync(
+    path.join(dir, "data", "passes", "pass-1.json"),
+    JSON.stringify(issues, null, 2),
+  );
+  const round = JSON.parse(
+    fs.readFileSync(path.join(dir, "data", "passes", "pass-1.json"), "utf-8"),
+  );
+  assert.deepStrictEqual(round, issues);
+  fs.rmSync(dir, { recursive: true });
 });
