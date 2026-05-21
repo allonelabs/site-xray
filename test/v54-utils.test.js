@@ -54,6 +54,21 @@ function issueId(type, selector, viewport) {
   return crypto.createHash("sha1").update(key).digest("hex").slice(0, 8);
 }
 
+function writePassIssues(outDir, passNum, issues) {
+  const n = Number(passNum);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new Error(
+      `writePassIssues: passNum must be a non-negative integer, got ${passNum}`,
+    );
+  }
+  const dir = path.join(outDir, "data", "passes");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, `pass-${n}.json`),
+    JSON.stringify(issues, null, 2),
+  );
+}
+
 test("issueId is stable for same inputs", () => {
   const a = issueId("click-no-op", "button.cta", { w: 1440, h: 900 });
   const b = issueId("click-no-op", "button.cta", { w: 1440, h: 900 });
@@ -68,17 +83,16 @@ test("issueId differs for different selectors", () => {
 
 test("writePassIssues serializes deterministically", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "v54-test-"));
-  fs.mkdirSync(path.join(dir, "data", "passes"), { recursive: true });
-  const issues = [
-    { id: "abc", type: "click-no-op", selector: "button", fixAttempts: 0 },
-  ];
-  fs.writeFileSync(
-    path.join(dir, "data", "passes", "pass-1.json"),
-    JSON.stringify(issues, null, 2),
-  );
-  const round = JSON.parse(
-    fs.readFileSync(path.join(dir, "data", "passes", "pass-1.json"), "utf-8"),
-  );
-  assert.deepStrictEqual(round, issues);
-  fs.rmSync(dir, { recursive: true });
+  try {
+    const issues = [
+      { id: "abc", type: "click-no-op", selector: "button", fixAttempts: 0 },
+    ];
+    writePassIssues(dir, 1, issues);
+    const round = JSON.parse(
+      fs.readFileSync(path.join(dir, "data", "passes", "pass-1.json"), "utf-8"),
+    );
+    assert.deepStrictEqual(round, issues);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

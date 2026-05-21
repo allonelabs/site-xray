@@ -278,10 +278,16 @@ function issueId(type, selector, viewport) {
 }
 
 function writePassIssues(outDir, passNum, issues) {
+  const n = Number(passNum);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new Error(
+      `writePassIssues: passNum must be a non-negative integer, got ${passNum}`,
+    );
+  }
   const dir = path.join(outDir, "data", "passes");
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(
-    path.join(dir, `pass-${passNum}.json`),
+    path.join(dir, `pass-${n}.json`),
     JSON.stringify(issues, null, 2),
   );
 }
