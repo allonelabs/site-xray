@@ -66,6 +66,8 @@ for (let i = 0; i < args.length; i++) {
     flags.verifyBudgetMs = (parseInt(args[++i]) || 300) * 1000;
   } else if (args[i] === "--debug-report") {
     flags.debugReport = true;
+  } else if (args[i] === "--concurrency") {
+    flags.concurrency = Math.max(1, Math.min(8, parseInt(args[++i]) || 1));
   } else if (args[i] === "--responsive") {
     flags.responsive = true;
   } else if (args[i] === "--push-git") {
@@ -112,6 +114,7 @@ Flags:
   --max-passes <N>         Cap verify+fix iterations (default: unlimited)
   --interaction-timeout <ms>  Per-click budget (default 3000)
   --verify-budget <sec>    Cap verify-phase wall-clock per pass (default 300)
+  --concurrency <N>        Crawl up to N pages in parallel (default 1, max 8)
   --debug-report           Always emit debug-report.html
   --responsive             Capture desktop/tablet/mobile screenshots (v53 backport)
 
@@ -6765,41 +6768,113 @@ async function main() {
     } catch (e) {}
   });
 
-  // Crawl loop — with per-page timeout
+  // Crawl loop — with per-page timeout. Concurrency 1 (default) keeps the
+  // original sequential behavior; >1 spins up additional pages in the same
+  // context that pull from the same queue in parallel. The first page is
+  // ALWAYS sequential because capturePage(_, _, /*isFirst*/true) downloads
+  // shared CSS/JS bundles that subpages reuse — running it in parallel
+  // would race the cache and re-download.
   let n = 0;
   const FIRST_PAGE_TIMEOUT = 300000; // 5 min for first page (downloads all assets)
   const PAGE_TIMEOUT = 60000; // 1 min for subsequent pages
-  while (queue.length > 0 && n < MAX_PAGES) {
-    const p = queue.shift();
-    if (crawled.has(p)) continue;
-    crawled.add(p);
-    try {
-      const timeout = n === 0 ? FIRST_PAGE_TIMEOUT : PAGE_TIMEOUT;
-      await Promise.race([
-        capturePage(page, p, n === 0),
-        new Promise((_, rej) =>
-          setTimeout(
-            () => rej(new Error(`Page timeout (${timeout / 1000}s)`)),
-            timeout,
-          ),
-        ),
-      ]);
-      n++;
-    } catch (e) {
-      console.log(`     ❌ ${e.message?.slice(0, 80)}`);
-      // If page crashed, create a new page context
+  const concurrency = flags.concurrency || 1;
+
+  // First page: always sequential, sets up sharedCSS/bundleLib for subpages.
+  if (queue.length > 0 && n < MAX_PAGES) {
+    const firstP = queue.shift();
+    if (!crawled.has(firstP)) {
+      crawled.add(firstP);
       try {
-        await page.close();
-      } catch {}
-      page = await context.newPage();
-      page.on("response", async (res) => {
+        await Promise.race([
+          capturePage(page, firstP, true),
+          new Promise((_, rej) =>
+            setTimeout(
+              () =>
+                rej(new Error(`Page timeout (${FIRST_PAGE_TIMEOUT / 1000}s)`)),
+              FIRST_PAGE_TIMEOUT,
+            ),
+          ),
+        ]);
+        n++;
+      } catch (e) {
+        console.log(`     ❌ ${e.message?.slice(0, 80)}`);
         try {
-          if (res.status() === 200 && networkURLs.size < MAX_NETWORK_URLS)
-            networkURLs.add(res.url());
-        } catch (e) {}
-      });
-      n++; // Count it so we don't get stuck
+          await page.close();
+        } catch {}
+        page = await context.newPage();
+        page.on("response", async (res) => {
+          try {
+            if (res.status() === 200 && networkURLs.size < MAX_NETWORK_URLS)
+              networkURLs.add(res.url());
+          } catch (e) {}
+        });
+        n++;
+      }
     }
+  }
+
+  // Worker pool for remaining pages. Each worker owns a page (the first
+  // worker reuses the existing `page`, others spin up new pages in the
+  // same context). Workers pull from the same `queue` until it's empty
+  // or n hits MAX_PAGES. JS is single-threaded so shared mutations on
+  // urlMap / networkURLs / crawled don't race at the language level.
+  const attachWorkerListeners = (p) => {
+    p.on("response", async (res) => {
+      try {
+        if (res.status() === 200 && networkURLs.size < MAX_NETWORK_URLS)
+          networkURLs.add(res.url());
+      } catch (e) {}
+    });
+  };
+  const workerLoop = async (workerIdx) => {
+    let myPage =
+      workerIdx === 0
+        ? page
+        : await (async () => {
+            const p = await context.newPage();
+            attachWorkerListeners(p);
+            return p;
+          })();
+    while (queue.length > 0 && n < MAX_PAGES) {
+      const p = queue.shift();
+      if (!p) break;
+      if (crawled.has(p)) continue;
+      crawled.add(p);
+      n++;
+      try {
+        await Promise.race([
+          capturePage(myPage, p, false),
+          new Promise((_, rej) =>
+            setTimeout(
+              () => rej(new Error(`Page timeout (${PAGE_TIMEOUT / 1000}s)`)),
+              PAGE_TIMEOUT,
+            ),
+          ),
+        ]);
+      } catch (e) {
+        console.log(`     ❌ ${e.message?.slice(0, 80)}`);
+        try {
+          await myPage.close();
+        } catch {}
+        myPage = await context.newPage();
+        attachWorkerListeners(myPage);
+        if (workerIdx === 0) page = myPage;
+      }
+    }
+    // Close worker page if it isn't the main `page` (which the rest of
+    // the clone phase reuses).
+    if (workerIdx > 0) {
+      try {
+        await myPage.close();
+      } catch {}
+    }
+  };
+
+  const workers = [];
+  for (let i = 0; i < concurrency; i++) workers.push(workerLoop(i));
+  await Promise.all(workers);
+  if (concurrency > 1) {
+    console.log(`     ⚡ concurrency: ${concurrency} workers (${n} pages)`);
   }
 
   // ═══════════════════════════════════════
