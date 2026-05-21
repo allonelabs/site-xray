@@ -160,14 +160,56 @@ Default engine is "auto": detects whether the site ships content in raw HTML
     }
   }
 
+  const wantsScore = cleanArgs.includes("--score");
+  // --score is a v54 flag; xray-static doesn't know it. Strip it from the
+  // static-engine args and run score-clone.js explicitly afterwards.
+  const engineArgs =
+    chosen === "static"
+      ? cleanArgs.filter((a, i, arr) => {
+          if (a === "--score") return false;
+          // --score takes no value, but the next arg might be the value of
+          // some preceding flag — leave others alone.
+          return true;
+        })
+      : cleanArgs;
+
   const script =
     chosen === "static"
       ? path.join(SCRIPT_DIR, "xray-static.js")
       : path.join(SCRIPT_DIR, "v54-stable.js");
-  const result = spawnSync("node", [script, ...cleanArgs], {
+  const result = spawnSync("node", [script, ...engineArgs], {
     stdio: "inherit",
   });
-  process.exit(result.status ?? 1);
+  if (result.status !== 0) process.exit(result.status ?? 1);
+
+  // If the user asked for --score on the static engine, run score-clone now.
+  // v54 handles its own --score via runScorePhase, so we don't double-run.
+  if (chosen === "static" && wantsScore) {
+    const outDir = positional[1] || guessOutDirFromHostname(url);
+    const scoreScript = path.join(SCRIPT_DIR, "score-clone.js");
+    const sc = spawnSync(
+      "node",
+      [
+        scoreScript,
+        url,
+        outDir,
+        "--out",
+        path.join(outDir, "data", "score.json"),
+      ],
+      { stdio: "inherit" },
+    );
+    process.exit(sc.status ?? 0);
+  }
+  process.exit(0);
+}
+
+function guessOutDirFromHostname(url) {
+  try {
+    const u = new URL(url);
+    return `/tmp/xray-static-${u.hostname.replace(/\./g, "-")}`;
+  } catch {
+    return "/tmp/xray-static-out";
+  }
 }
 
 main().catch((e) => {
