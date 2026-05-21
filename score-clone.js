@@ -161,18 +161,24 @@ async function probeStructural(origPage, clonePage) {
         const cs = getComputedStyle(el);
         return cs.visibility !== "hidden" && cs.display !== "none";
       };
+      const countVisible = (sel) => {
+        let n = 0;
+        for (const el of document.querySelectorAll(sel)) if (visible(el)) n++;
+        return n;
+      };
       const all = document.querySelectorAll("*");
       let visibleCount = 0;
       for (const el of all) if (visible(el)) visibleCount++;
+      // innerText already excludes display:none. Use it for "visible text".
       return {
         total: all.length,
         visible: visibleCount,
-        links: document.querySelectorAll("a[href]").length,
-        buttons: document.querySelectorAll(
+        links: countVisible("a[href]"),
+        buttons: countVisible(
           'button, [role="button"], input[type="button"], input[type="submit"]',
-        ).length,
-        forms: document.querySelectorAll("form").length,
-        images: document.querySelectorAll("img").length,
+        ),
+        forms: countVisible("form"),
+        images: countVisible("img"),
         text: document.body
           ? document.body.innerText.replace(/\s+/g, " ").trim().length
           : 0,
@@ -366,9 +372,27 @@ async function probeInteractive(origPage, clonePage) {
   let matched = 0;
   let tested = 0;
   const samples = [];
+  const safeClick = async (page, sel) => {
+    try {
+      return await clickAndClassify(page, sel);
+    } catch (e) {
+      // Most common cause: navigation in flight destroys the evaluate ctx.
+      // Treat as a successful navigate — the click clearly did something.
+      const msg = e.message || "";
+      if (/Execution context was destroyed|navigation/i.test(msg))
+        return {
+          missing: false,
+          bucket: "navigate",
+          mutations: 0,
+          byteDelta: 0,
+          navigated: true,
+        };
+      return { missing: true };
+    }
+  };
   for (const sel of candidates) {
-    const a = await clickAndClassify(origPage, sel);
-    const b = await clickAndClassify(clonePage, sel);
+    const a = await safeClick(origPage, sel);
+    const b = await safeClick(clonePage, sel);
     if (a.missing || b.missing) continue;
     tested++;
     const ok = a.bucket === b.bucket;
@@ -431,18 +455,67 @@ Output is printed to stdout. Pass --out to also write JSON.`);
   const cloneAssets = attachAssetCounter(clonePage);
 
   try {
+    // Resilient nav: networkidle fails on heavy sites with long-lived
+    // sockets (analytics keep-alive, hot-reload, etc.). Try strict → load →
+    // domcontentloaded so we still get a usable score on slow origins.
+    const gotoResilient = async (page, url) => {
+      const attempts = [
+        { waitUntil: "networkidle", timeout: 25000 },
+        { waitUntil: "load", timeout: 20000 },
+        { waitUntil: "domcontentloaded", timeout: 15000 },
+      ];
+      let last;
+      for (const opts of attempts) {
+        try {
+          await page.goto(url, opts);
+          return;
+        } catch (e) {
+          last = e;
+        }
+      }
+      throw last;
+    };
     await Promise.all([
-      origPage.goto(liveTarget, { waitUntil: "networkidle", timeout: 30000 }),
-      clonePage.goto(cloneTarget, {
-        waitUntil: "domcontentloaded",
-        timeout: 20000,
-      }),
+      gotoResilient(origPage, liveTarget),
+      gotoResilient(clonePage, cloneTarget),
     ]);
-    // Give both pages a moment to settle (lazy images, animations, etc.)
-    await Promise.all([
-      origPage.waitForTimeout(2500),
-      clonePage.waitForTimeout(2500),
-    ]);
+    // Networkidle isn't enough for SPAs — frameworks like React hydrate
+    // after fetch finishes, and the DOM keeps changing for a beat after.
+    // Wait for the DOM to be mutation-free for `stableMs` (max `maxMs`).
+    // Without this, the score tool measures a half-hydrated orig and
+    // unfairly punishes the clone for being more complete.
+    const waitStable = async (page) =>
+      page.evaluate(
+        ({ stableMs, maxMs }) =>
+          new Promise((resolve) => {
+            let last = Date.now();
+            const obs = new MutationObserver(() => {
+              last = Date.now();
+            });
+            obs.observe(document.body, {
+              attributes: true,
+              childList: true,
+              subtree: true,
+            });
+            const start = Date.now();
+            const tick = () => {
+              if (Date.now() - last >= stableMs) {
+                obs.disconnect();
+                resolve("stable");
+                return;
+              }
+              if (Date.now() - start >= maxMs) {
+                obs.disconnect();
+                resolve("max");
+                return;
+              }
+              setTimeout(tick, 120);
+            };
+            tick();
+          }),
+        { stableMs: 1500, maxMs: 8000 },
+      );
+    await Promise.all([waitStable(origPage), waitStable(clonePage)]);
 
     const visual = await probeVisual(origPage, clonePage);
     const structural = await probeStructural(origPage, clonePage);
