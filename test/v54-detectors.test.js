@@ -85,8 +85,8 @@ test(
       const out = (res.stdout || "") + (res.stderr || "");
       assert.match(
         out,
-        /broken-form-action/,
-        `expected broken-form-action in output; got:\n${out}`,
+        /broken-form/,
+        `expected broken-form in output; got:\n${out}`,
       );
     });
   },

@@ -877,8 +877,8 @@ async function auditForms(clonePage) {
     if (e.hostname && e.hostname !== e.localHost) {
       const selector = e.id ? "#" + e.id : "form";
       issues.push({
-        id: issueId("broken-form-action", selector, { w: 1440, h: 900 }),
-        type: "broken-form-action",
+        id: issueId("broken-form", selector, { w: 1440, h: 900 }),
+        type: "broken-form",
         selector,
         viewport: { w: 1440, h: 900 },
         evidence: {
@@ -888,7 +888,7 @@ async function auditForms(clonePage) {
           localHost: e.localHost,
           method: e.method,
         },
-        fixStrategy: "broken-form-action",
+        fixStrategy: "broken-form",
         fixAttempts: 0,
         resolvedInPass: null,
       });
