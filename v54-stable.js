@@ -1307,7 +1307,13 @@ const FIX_STRATEGIES = {
   "missing-animation": [fixMissingAnimation],
   "visual-drift-animated": [fixMissingAnimation],
   "scroll-anim-drift": [fixMissingAnimation],
-  // other types populated by D4-D5
+  "console-error-404": [fixConsoleError404],
+  "lazy-image-stuck": [fixLazyImageStuck],
+  "missing-font-glyphs": [fixMissingFontGlyphs],
+  "missing-svg-symbol": [fixMissingSvgSymbol],
+  "webgl-shader-fail": [fixWebglShaderFail],
+  // detectors for lazy-image-stuck / missing-font-glyphs / missing-svg-symbol / webgl-shader-fail are not yet implemented — fixers ready for future detector hookups
+  // other types populated by D5
 };
 
 async function applyFix(issue, outDir, origPage, clonePage) {
@@ -1720,6 +1726,136 @@ async function fixAnimationByComputedStyleSnapshot(
     ok: false,
     notes: "page-level animation fix not implemented; manual review needed",
   };
+}
+
+// ─── v54 D4: Asset-family fix strategies ──────────────────────────────
+// console-error-404: refetch the asset from origin using a browser-ish UA + Referer
+// and rewrite all in-HTML references to the new local path.
+async function fixConsoleError404(issue, outDir, origPage, clonePage) {
+  const url = issue.evidence?.sourceUrl;
+  if (!url) return { ok: false, notes: "no source URL" };
+  try {
+    const u = new URL(url);
+    const resp = await origPage.context().request.get(url, {
+      headers: {
+        Referer: DOMAIN,
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+      },
+    });
+    if (resp.status() !== 200)
+      return { ok: false, notes: `refetch status ${resp.status()}` };
+    const body = await resp.body();
+    const localName = path.basename(u.pathname) || "asset";
+    const destDir = path.join(outDir, "js");
+    fs.mkdirSync(destDir, { recursive: true });
+    fs.writeFileSync(path.join(destDir, localName), body);
+    // Update urlMap and rewrite index.html
+    const indexPath = path.join(outDir, "index.html");
+    let html = fs.readFileSync(indexPath, "utf-8");
+    html = html.replaceAll(url, `/js/${localName}`);
+    fs.writeFileSync(indexPath, html);
+    return { ok: true, notes: `refetched ${url} → /js/${localName}` };
+  } catch (e) {
+    return { ok: false, notes: `refetch error: ${e.message?.slice(0, 80)}` };
+  }
+}
+
+// lazy-image-stuck: strip loading="lazy" + promote data-src→src so images
+// resolve immediately when offline/static-served.
+async function fixLazyImageStuck(issue, outDir, origPage, clonePage) {
+  const indexPath = path.join(outDir, "index.html");
+  let html = fs.readFileSync(indexPath, "utf-8");
+  const sentinel = `<!--v54-fix:${issue.id}-->`;
+  if (html.includes(sentinel)) return { ok: false, notes: "already attempted" };
+  let changed = false;
+  html = html.replace(/(<img[^>]*?)\sloading="lazy"/g, (m, p) => {
+    changed = true;
+    return p;
+  });
+  html = html.replace(/(<img[^>]*?)\sdata-src="([^"]+)"/g, (m, p, src) => {
+    changed = true;
+    return `${p} src="${src}"`;
+  });
+  if (!changed) return { ok: false, notes: "no lazy-image patterns matched" };
+  html = html.replace("</body>", `${sentinel}\n</body>`);
+  fs.writeFileSync(indexPath, html);
+  return { ok: true, notes: "unblocked lazy images" };
+}
+
+// missing-font-glyphs: append a system-font fallback chain so unloadable
+// custom faces still render with reasonable metrics.
+async function fixMissingFontGlyphs(issue, outDir, origPage, clonePage) {
+  // Inject system-font fallback chain into existing font-face usages
+  const indexPath = path.join(outDir, "index.html");
+  let html = fs.readFileSync(indexPath, "utf-8");
+  const sentinel = `<!--v54-fix:${issue.id}-->`;
+  if (html.includes(sentinel)) return { ok: false, notes: "already attempted" };
+  const fallback = `\n${sentinel}\n<style>*, body { font-family: var(--v54-font-family-original, inherit), system-ui, -apple-system, "Segoe UI", Roboto, sans-serif !important; }</style>\n`;
+  html = html.replace("</head>", fallback + "</head>");
+  fs.writeFileSync(indexPath, html);
+  return { ok: true, notes: "added system-font fallback chain" };
+}
+
+// missing-svg-symbol: harvest <svg><symbol>…</symbol></svg> sprite blocks
+// from the original page and inline them at the top of the clone's body.
+async function fixMissingSvgSymbol(issue, outDir, origPage, clonePage) {
+  // Locate sprite definitions in original and inline into clone's body top
+  const sprite = await origPage.evaluate(() => {
+    const sprites = Array.from(document.querySelectorAll("svg"));
+    const symbolSprites = sprites.filter((s) => s.querySelector("symbol"));
+    return symbolSprites.map((s) => s.outerHTML).join("\n");
+  });
+  if (!sprite)
+    return { ok: false, notes: "no symbol sprite found in original" };
+  const indexPath = path.join(outDir, "index.html");
+  let html = fs.readFileSync(indexPath, "utf-8");
+  const sentinel = `<!--v54-fix:${issue.id}-->`;
+  if (html.includes(sentinel)) return { ok: false, notes: "already attempted" };
+  html = html.replace(
+    "<body>",
+    `<body>\n${sentinel}\n<div style="display:none">${sprite}</div>\n`,
+  );
+  fs.writeFileSync(indexPath, html);
+  return { ok: true, notes: "inlined SVG sprite from original" };
+}
+
+// webgl-shader-fail: snapshot the original canvas to a data-URI PNG and
+// swap the clone's <canvas> tag for a static <img> poster.
+async function fixWebglShaderFail(issue, outDir, origPage, clonePage) {
+  // Take a screenshot of the WebGL canvas state on original and replace canvas with <img>
+  if (!issue.selector) return { ok: false, notes: "no selector" };
+  try {
+    const dataUri = await origPage.evaluate((sel) => {
+      const canv = document.querySelector(sel);
+      if (!canv || canv.tagName !== "CANVAS") return null;
+      try {
+        return canv.toDataURL("image/png");
+      } catch {
+        return null;
+      }
+    }, issue.selector);
+    if (!dataUri) return { ok: false, notes: "could not capture canvas" };
+    const indexPath = path.join(outDir, "index.html");
+    let html = fs.readFileSync(indexPath, "utf-8");
+    const sentinel = `<!--v54-fix:${issue.id}-->`;
+    if (html.includes(sentinel))
+      return { ok: false, notes: "already attempted" };
+    html = html.replace(
+      new RegExp(
+        `<canvas[^>]*${escapeRegExp(issue.selector.replace(/^#/, ""))}[^>]*>`,
+        "g",
+      ),
+      `${sentinel}<img src="${dataUri}" alt="webgl poster"/>`,
+    );
+    fs.writeFileSync(indexPath, html);
+    return { ok: true, notes: "replaced WebGL canvas with poster screenshot" };
+  } catch (e) {
+    return {
+      ok: false,
+      notes: `webgl poster error: ${e.message?.slice(0, 80)}`,
+    };
+  }
 }
 
 // v54 D1: Minimal one-pass fix runner. Each call advances all issues by one strategy step.
