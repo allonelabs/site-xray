@@ -8266,7 +8266,16 @@ async function shipToVercel(outDir, slug) {
   return lines[lines.length - 1];
 }
 
-main().catch((e) => {
-  console.error("Error:", e.message);
-  process.exit(1);
-});
+main()
+  .then(() => {
+    // Force exit. browser.close() doesn't always release every Playwright
+    // handle on macOS, and the screenshot python server detaches via
+    // process.kill(-pid); occasionally a child stays attached and keeps
+    // the event loop alive. After main resolves, all CLI-relevant work
+    // is done — exit explicitly so the tool returns to the shell.
+    process.exit(0);
+  })
+  .catch((e) => {
+    console.error("Error:", e.message);
+    process.exit(1);
+  });
