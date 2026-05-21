@@ -523,17 +523,16 @@ async function runVerifyPhase(outDir, browser, flags) {
     ignoreHTTPSErrors: true,
     viewport: { width: 1440, height: 900 },
   });
-  const origPage = await context.newPage();
-  const clonePage = await cloneContext.newPage();
-  // Verify-phase navigation is fragile against live sites that get sluggish
-  // after a long crawl (we saw page.goto timeout on bottega53). Try the
-  // strictest wait first, fall back to looser ones with backoff before giving
-  // up. Total budget ~75s per page (still fast enough; was 20s before).
-  async function gotoResilient(page, url, label) {
-    // Each attempt is also wrapped in a wall-clock Promise.race because we
-    // saw Playwright's own timeout fail to fire in pathological cases
-    // (bottega53.com hung the second attempt for 30+ minutes). The wall-
-    // clock buffer is timeout + 5s, so Playwright still wins normally.
+  let origPage = await context.newPage();
+  let clonePage = await cloneContext.newPage();
+  // Resilient nav: try 3 progressively looser waitUntil modes. Each attempt
+  // is wrapped in a wall-clock Promise.race because we saw Playwright's own
+  // timeout fail to fire on certain hung sites. Crucially we *close and
+  // reopen the page* between attempts — Promise.race only rejects the
+  // wrapper Promise, the underlying page.goto stays in flight and would
+  // serialize the next goto behind it (we saw this hang verify for 30+ min
+  // on bottega53). Closing the page actually cancels the operation.
+  async function gotoResilient(ctx, currentPage, url, label) {
     const attempts = [
       { waitUntil: "networkidle", timeout: 25000 },
       { waitUntil: "load", timeout: 20000 },
@@ -547,6 +546,7 @@ async function runVerifyPhase(outDir, browser, flags) {
         ),
       ]);
     let lastErr;
+    let page = currentPage;
     for (let k = 0; k < attempts.length; k++) {
       try {
         await withDeadline(
@@ -554,19 +554,30 @@ async function runVerifyPhase(outDir, browser, flags) {
           attempts[k].timeout + 5000,
           `${label} ${attempts[k].waitUntil}`,
         );
-        return;
+        return page;
       } catch (e) {
         lastErr = e;
         console.log(
           `     ↻ verify ${label} ${attempts[k].waitUntil} failed (${(e.message || "").slice(0, 60)}); ${k < attempts.length - 1 ? "retrying" : "giving up"}`,
         );
+        if (k < attempts.length - 1) {
+          try {
+            await page.close({ runBeforeUnload: false });
+          } catch {}
+          page = await ctx.newPage();
+        }
       }
     }
     throw lastErr;
   }
   try {
-    await gotoResilient(origPage, originUrl, "origin");
-    await gotoResilient(clonePage, server.url, "clone");
+    origPage = await gotoResilient(context, origPage, originUrl, "origin");
+    clonePage = await gotoResilient(
+      cloneContext,
+      clonePage,
+      server.url,
+      "clone",
+    );
     // v54 C2: inject PIXEL_DIFF_SRC via addScriptTag (NOT evaluate) so
     // pixelDiff becomes a window-global on both pages and is callable from
     // subsequent page.evaluate() calls in probeHover.
@@ -823,63 +834,83 @@ async function observeClick(page, selector, timeoutMs) {
   page.on("console", onConsole);
   page.on("framenavigated", onNav);
   const wait = Math.min(Math.max(timeoutMs, 200), 5000);
-  const result = await page
-    .evaluate(
-      ({ selector, wait }) => {
-        return new Promise((resolve) => {
-          const el = document.querySelector(selector);
-          if (!el) {
-            resolve({
-              missing: true,
-              mutationCount: 0,
-              openedPanel: false,
-              navigated: false,
-            });
-            return;
-          }
-          let mutationCount = 0;
-          const obs = new MutationObserver((records) => {
-            mutationCount += records.length;
+  // Per-click wall-clock cap. observeClick on bottega took 578s across 50
+  // candidates (~5.8s each) — well above the 800ms in-page wait. Most of
+  // that overhead is post-click reflow/network on busy pages. Bound the
+  // outer awaited promise to (wait + 1500ms), then move on. If we time
+  // out, classify as a non-navigating no-act result.
+  const evalPromise = page.evaluate(
+    ({ selector, wait }) => {
+      return new Promise((resolve) => {
+        const el = document.querySelector(selector);
+        if (!el) {
+          resolve({
+            missing: true,
+            mutationCount: 0,
+            openedPanel: false,
+            navigated: false,
           });
-          obs.observe(document.body, {
-            attributes: true,
-            childList: true,
-            subtree: true,
-            characterData: true,
-          });
-          const openBefore = document.querySelectorAll(
+          return;
+        }
+        let mutationCount = 0;
+        const obs = new MutationObserver((records) => {
+          mutationCount += records.length;
+        });
+        obs.observe(document.body, {
+          attributes: true,
+          childList: true,
+          subtree: true,
+          characterData: true,
+        });
+        const openBefore = document.querySelectorAll(
+          '[aria-expanded="true"], [data-state="open"]',
+        ).length;
+        const beforeBytes = document.body.innerHTML.length;
+        try {
+          el.click();
+        } catch (e) {
+          /* swallow — surfaces via console listener */
+        }
+        setTimeout(() => {
+          const openAfter = document.querySelectorAll(
             '[aria-expanded="true"], [data-state="open"]',
           ).length;
-          const beforeBytes = document.body.innerHTML.length;
-          try {
-            el.click();
-          } catch (e) {
-            /* swallow — surfaces via console listener */
-          }
-          setTimeout(() => {
-            const openAfter = document.querySelectorAll(
-              '[aria-expanded="true"], [data-state="open"]',
-            ).length;
-            obs.disconnect();
-            const afterBytes = document.body.innerHTML.length;
-            resolve({
-              missing: false,
-              mutationCount,
-              byteDelta: Math.abs(afterBytes - beforeBytes),
-              openedPanel: openAfter > openBefore,
-              navigated: false,
-            });
-          }, wait);
-        });
-      },
-      { selector, wait: Math.min(wait, 800) },
-    )
-    .catch(() => ({
+          obs.disconnect();
+          const afterBytes = document.body.innerHTML.length;
+          resolve({
+            missing: false,
+            mutationCount,
+            byteDelta: Math.abs(afterBytes - beforeBytes),
+            openedPanel: openAfter > openBefore,
+            navigated: false,
+          });
+        }, wait);
+      });
+    },
+    { selector, wait: Math.min(wait, 800) },
+  );
+  const result = await Promise.race([
+    evalPromise.catch(() => ({
       missing: false,
       mutationCount: 0,
       openedPanel: false,
       navigated: true,
-    }));
+    })),
+    new Promise((resolve) =>
+      setTimeout(
+        () =>
+          resolve({
+            missing: false,
+            mutationCount: 0,
+            byteDelta: 0,
+            openedPanel: false,
+            navigated: false,
+            timedOut: true,
+          }),
+        Math.min(wait, 800) + 1500,
+      ),
+    ),
+  ]);
   page.off("console", onConsole);
   page.off("framenavigated", onNav);
   return {
