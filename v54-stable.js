@@ -4515,12 +4515,18 @@ async function capturePage(page, urlPath, isFirst) {
           animScript += `});\n`;
 
           // ── Hover effects on image containers ──
-          animScript += `document.querySelectorAll('button,a,[role="button"]').forEach(el=>{\n`;
-          animScript += `  el.style.pointerEvents="auto";el.style.cursor="pointer";\n`;
-          animScript += `  const img=el.querySelector("img");if(!img)return;\n`;
-          animScript += `  el.addEventListener("mouseenter",()=>gsap.to(img,{scale:1.03,filter:"brightness(0.9)",duration:0.75,ease:"expo.out"}));\n`;
-          animScript += `  el.addEventListener("mouseleave",()=>gsap.to(img,{scale:1,filter:"brightness(1)",duration:0.75,ease:"expo.out"}));\n`;
-          animScript += `});\n`;
+          // REMOVED v54: this blanket script does two harmful things on real
+          // sites (validated against bottega53/goga photography clone):
+          //   1. pointer-events:auto on every <a>/<button>/[role=button] breaks
+          //      legitimate pointer-events:none on collapsed UI (filter panels,
+          //      mobile menus, modal backdrops). Anchors steal clicks across
+          //      the whole viewport when their parent should be inert.
+          //   2. gsap.to(img, {brightness:0.9, ...}) on every hover darkens
+          //      images on hover — a heuristic, not real behavior of most
+          //      sites. With expo.out easing it reads as a "black glitch".
+          // Most sites already have correct hover behavior in their own CSS;
+          // forcing this from outside is net-negative. The cloner doesn't add
+          // hover effects; if a site has them, its own CSS already does so.
 
           // Save generated script for debugging
           fs.writeFileSync(`${OUT}/data/animations.js`, animScript);
@@ -5207,6 +5213,75 @@ async function capturePage(page, urlPath, isFirst) {
     } catch {}
   }
 
+  // ── DOM cleanup before capture (v54: bottega53/goga feedback) ──
+  // Strip framework-runtime residue that the clone shouldn't preserve:
+  //  - GSAP ScrollTrigger pin-spacer wrappers (cause double-scroll on rebind)
+  //  - lenis lenis-smooth classes baked onto <html> (override scroll feel)
+  //  - router-link-* Vue runtime classes
+  //  - data-revealed / data-v-revealed attributes (animation residue)
+  //  - inline transforms with subpixel translate values (mid-frame snapshots)
+  //  - inline opacity:0 on common content elements (animation-not-finished)
+  await page
+    .evaluate(() => {
+      try {
+        // Unwrap GSAP pin-spacer wrappers — replace with children.
+        document.querySelectorAll(".pin-spacer").forEach((p) => {
+          const parent = p.parentNode;
+          if (!parent) return;
+          while (p.firstChild) parent.insertBefore(p.firstChild, p);
+          p.remove();
+        });
+      } catch {}
+      try {
+        // Lenis baked into <html>: strip its runtime classes.
+        const root = document.documentElement;
+        if (root && root.className) {
+          root.className = root.className
+            .split(/\s+/)
+            .filter((c) => !/^lenis/i.test(c))
+            .join(" ");
+        }
+      } catch {}
+      try {
+        // router-link-active / data-revealed: ephemeral runtime state.
+        document
+          .querySelectorAll(".router-link-active, .router-link-exact-active")
+          .forEach((el) => {
+            el.classList.remove(
+              "router-link-active",
+              "router-link-exact-active",
+            );
+          });
+        document.querySelectorAll("[data-revealed]").forEach((el) => {
+          el.removeAttribute("data-revealed");
+        });
+      } catch {}
+      try {
+        // Strip subpixel-translate residue from inline transforms. These are
+        // mid-frame ScrollTrigger/GSAP states that don't survive re-mount.
+        // Recognized patterns:
+        //   matrix(1,0,0,1,-0.0009,0)
+        //   translate3d(-0.0009px,0px,0px)
+        //   translate(-0.0009px, 0px)
+        const residueRE =
+          /(?:matrix|translate3d|translate)\(\s*[-\d.,\s]*?(?:-?\d*\.\d+|-?\d+)\s*[,)]/;
+        document.querySelectorAll("[style*='transform']").forEach((el) => {
+          const t = el.style.transform || "";
+          if (!t) return;
+          // Detect subpixel: any extracted number < 1 in absolute value AND > 0.
+          const nums = t.match(/-?\d*\.\d+|-?\d+/g) || [];
+          const hasSubpixel = nums.some((s) => {
+            const n = Math.abs(parseFloat(s));
+            return n > 0 && n < 1;
+          });
+          if (hasSubpixel && residueRE.test(t)) {
+            el.style.removeProperty("transform");
+          }
+        });
+      } catch {}
+    })
+    .catch(() => {});
+
   // ── Capture rendered DOM ──
   const renderedHTML = await page.content();
 
@@ -5485,7 +5560,51 @@ ${flags.visual ? "" : `<style>/*v43:freeze animations+cursor+selection for deter
         ? `<style>/*v52:visual-mode fixes*/[data-state="closed"],[data-state="inactive"]{display:none!important}[class*="viewportPosition"],[class*="NavigationMenuViewport"],[class*="nav-viewport"]{display:none!important}[class*="skipLink"],[class*="skip-nav"],[class*="skip-to"]{display:none!important}[class*="mobile-menu"]:not([data-state="open"]){display:none!important}[class*="popover"]:not([data-state="open"]){display:none!important}</style>`
         : "") +
       `
-<script>/*v44:stub globals for analytics/tracking — prevents console errors in clone*/try{if(!window.dataLayer)window.dataLayer=[];if(!window.gtag)window.gtag=function(){};if(!window.ga)window.ga=function(){};if(!window.fbq)window.fbq=function(){};if(!window._satellite)window._satellite={track:function(){},getVar:function(){},setVar:function(){}};if(!window.optimizely)window.optimizely={push:function(){}};if(!window.__tcfapi)window.__tcfapi=function(){}}catch(e){}</script>
+<script>/*v44+v54:stub globals to prevent console errors in clone.
+  Two families:
+  1) Analytics: dataLayer, gtag, ga, fbq, _satellite, optimizely, __tcfapi.
+  2) Animation libs: gsap, ScrollTrigger, Lenis, anime, AOS, IntersectionObserver-as-fallback.
+     We can't run these libraries in a static clone, but inline page scripts
+     still call gsap.timeline().to(...).set(...) etc. Returning a deeply-
+     chainable Proxy from every property/call swallows arbitrary fluent APIs
+     without throwing. Visual-mode clones don't need motion to work — just
+     to not break the page.*/
+try{
+  if(!window.dataLayer)window.dataLayer=[];
+  if(!window.gtag)window.gtag=function(){};
+  if(!window.ga)window.ga=function(){};
+  if(!window.fbq)window.fbq=function(){};
+  if(!window._satellite)window._satellite={track:function(){},getVar:function(){},setVar:function(){}};
+  if(!window.optimizely)window.optimizely={push:function(){}};
+  if(!window.__tcfapi)window.__tcfapi=function(){};
+  var __ch=new Proxy(function(){return __ch;},{get:function(t,p){if(p===Symbol.toPrimitive)return function(){return 0;};if(p==="length")return 0;return __ch;},apply:function(){return __ch;}});
+  var __mkStub=function(){return new Proxy(function(){return __ch;},{get:function(t,p){return __ch;},apply:function(){return __ch;}});};
+  if(!window.gsap)window.gsap=__mkStub();
+  if(!window.ScrollTrigger)window.ScrollTrigger=__mkStub();
+  if(!window.ScrollSmoother)window.ScrollSmoother=__mkStub();
+  if(!window.SplitText)window.SplitText=__mkStub();
+  if(!window.Lenis)window.Lenis=function(){return __ch;};
+  if(!window.anime)window.anime=__mkStub();
+  if(!window.AOS)window.AOS={init:function(){},refresh:function(){},refreshHard:function(){}};
+  if(!window.Swiper)window.Swiper=function(){return __ch;};
+  if(!window.barba)window.barba=__mkStub();
+  // Soft-fail DOM APIs that inline scripts may call with stub return values
+  // (e.g. getComputedStyle(gsap.utils.toArray(".foo")[0])). Returning an
+  // empty-string style is safer than throwing — visual mode is a snapshot.
+  var __gcs=window.getComputedStyle;
+  window.getComputedStyle=function(el,ps){try{return __gcs.call(this,el,ps);}catch(e){return new Proxy({},{get:function(){return "";}});}};
+  // Last-resort error swallower for stub-shape mismatches that still slip
+  // through (rare TypeError on chained reads). Only swallows TypeErrors
+  // mentioning typical stub-cause strings; real ReferenceError still surfaces.
+  window.addEventListener("error",function(e){
+    var m=(e&&e.message)||"";
+    if(/of undefined|is not a function|of null|parameter 1 is not of type/.test(m)){
+      e.preventDefault();
+      return true;
+    }
+  },true);
+}catch(e){}
+</script>
 <link rel="icon" href="/favicon.ico"/>
 </head>`,
   );
@@ -5738,6 +5857,12 @@ try{
 try{
   const carouselWrapperSel='.swiper-wrapper,.flickity-viewport,.slick-track,.owl-stage,.glide__track,.splide__track,[class*="carousel-inner"]';
   const carouselSlideSel='.swiper-slide,.flickity-cell,.slick-slide,.carousel-item,.owl-item,.glide__slide,.splide__slide';
+  // v54: expanded skip-list based on bottega53/gogaphotography feedback —
+  // hover-reveal patterns (.image-item__info, .category-item__info, photo
+  // captions) legitimately keep opacity:0 at rest. Forcing them visible
+  // stuck couple-name/venue labels on permanently. Skip elements whose
+  // class names indicate hover-reveal/overlay semantics.
+  const hoverRevealRE=/(?:^|[-_])(info|caption|label|overlay|hover|reveal|meta|description|tooltip|hint|byline|tag)(?:$|[-_])/i;
   document.querySelectorAll('section,article,div,h1,h2,h3,h4,p,span,figure,ul,li,a,header,footer,main').forEach(el=>{
     try{
       const cs=getComputedStyle(el);
@@ -5750,6 +5875,9 @@ try{
         const ecls3=(el.className||'').toString();
         if(/dropdown|popover|flyout|mega.?menu|submenu|tooltip/i.test(ecls3))return;
         if(el.closest('[class*="dropdown"],[class*="Dropdown"],[class*="popover"],[class*="Popover"],[class*="flyout"],[class*="tooltip"]'))return;
+        // v54: Skip hover-reveal patterns (photo captions, info overlays etc.)
+        if(hoverRevealRE.test(ecls3))return;
+        if(el.closest('[class*="image-item__info"],[class*="category-item__info"],[class*="card-overlay"],[class*="card__info"],[class*="tile-info"]'))return;
         // Skip tiny elements (decorative)
         const r=el.getBoundingClientRect();
         if(r.width<10||r.height<5)return;
@@ -6110,6 +6238,9 @@ async function main() {
       writeDebugReport(targetDir, loopResult, flags);
     } finally {
       await browser.close();
+    }
+    if (flags.pushGit || flags.deploy) {
+      await runShipPhase(targetDir, flags, PARSED.hostname);
     }
     return;
   }
@@ -6705,7 +6836,12 @@ async function main() {
 
         // v17: Inject full UI interactivity (same as main path)
         const cleanUIScript = `
-document.querySelectorAll('button,a,[role="button"],[tabindex="0"],[class*="btn"],[class*="cta"],[class*="link"]').forEach(el=>{el.style.pointerEvents='auto';el.style.cursor='pointer'});
+// v54: REMOVED blanket pointer-events:auto — broke pointer-events:none on
+// collapsed filter panels (feedback from bottega53 clone). Only sets cursor
+// now. If real interactive elements end up with pointer-events:none in the
+// clone, that's animation residue we should strip in the clone phase, not
+// override at runtime.
+document.querySelectorAll('button,a,[role="button"],[tabindex="0"],[class*="btn"],[class*="cta"],[class*="link"]').forEach(el=>{el.style.cursor='pointer'});
 if(!document.querySelector('nav,[role="navigation"]')){
   const hdr=document.querySelector('header,[class*="header"],[class*="Header"],[class*="nav-bar"],[class*="navbar"],[class*="top-bar"]');
   if(hdr){
@@ -6722,6 +6858,8 @@ if(!document.querySelector('nav,[role="navigation"]')){
 try{
   const carouselWrapperSel='.swiper-wrapper,.flickity-viewport,.slick-track,.owl-stage,.glide__track,.splide__track,[class*="carousel-inner"]';
   const carouselSlideSel='.swiper-slide,.flickity-cell,.slick-slide,.carousel-item,.owl-item,.glide__slide,.splide__slide';
+  // v54: hover-reveal exclusion (bottega53 feedback) — see notes earlier.
+  const hoverRevealRE=/(?:^|[-_])(info|caption|label|overlay|hover|reveal|meta|description|tooltip|hint|byline|tag)(?:$|[-_])/i;
   document.querySelectorAll('section,article,div,h1,h2,h3,h4,p,span,figure,main').forEach(el=>{
     try{
       const cs=getComputedStyle(el);
@@ -6732,6 +6870,9 @@ try{
         const ecls4=(el.className||'').toString();
         if(/dropdown|popover|flyout|mega.?menu|submenu|tooltip/i.test(ecls4))return;
         if(el.closest('[class*="dropdown"],[class*="Dropdown"],[class*="popover"],[class*="Popover"],[class*="flyout"],[class*="tooltip"]'))return;
+        // v54: Skip hover-reveal patterns
+        if(hoverRevealRE.test(ecls4))return;
+        if(el.closest('[class*="image-item__info"],[class*="category-item__info"],[class*="card-overlay"],[class*="card__info"],[class*="tile-info"]'))return;
         const r=el.getBoundingClientRect();
         if(r.width<10||r.height<5)return;
         el.style.setProperty('opacity','1','important');
@@ -7750,52 +7891,66 @@ ${stubFooter || ""}
 
   await browser.close();
 
-  // Ship phase — optional. Runs only when one of --push-git, --deploy,
-  // --ship is set. Each operation is wrapped so a failure in git doesn't
-  // skip the deploy.
   if (flags.pushGit || flags.deploy) {
-    console.log("\n🚀 Ship phase\n");
-    const slug =
-      flags.shipName ||
-      (flags.gitRepo && flags.gitRepo.split("/").pop()) ||
-      makeShipSlug(PARSED.hostname);
-    const repo = flags.gitRepo || `allonelabs/${slug}`;
-    let gitURL = null;
-    let deployURL = null;
-    if (flags.pushGit) {
-      try {
-        gitURL = await shipToGit(OUT, repo);
-        console.log(`   🐙 git → ${gitURL}`);
-      } catch (e) {
-        console.log(
-          `   ⚠ git push failed: ${(e.stderr || e.message || "").toString().slice(0, 160)}`,
-        );
-      }
-    }
-    if (flags.deploy) {
-      try {
-        deployURL = await shipToVercel(OUT, slug);
-        console.log(`   ▲ vercel → ${deployURL}`);
-      } catch (e) {
-        console.log(
-          `   ⚠ vercel deploy failed: ${(e.stderr || e.message || "").toString().slice(0, 160)}`,
-        );
-      }
-    }
-    // Write the ship URLs into manifest.json so they're discoverable later.
+    await runShipPhase(OUT, flags, PARSED.hostname);
+  }
+}
+
+// Ship phase — optional. Runs only when one of --push-git, --deploy, --ship
+// is set. Each operation is wrapped so a failure in git doesn't skip the
+// deploy. Callable from both the full clone+verify path and --verify-only.
+async function runShipPhase(outDir, flags, fallbackHostname) {
+  console.log("\n🚀 Ship phase\n");
+  // Recover the live hostname from the manifest when --verify-only is run
+  // without a positional URL (PARSED is then a localhost placeholder).
+  let hostname = fallbackHostname;
+  if (hostname === "localhost") {
     try {
-      const mp = path.join(OUT, "data", "manifest.json");
-      const m = JSON.parse(fs.readFileSync(mp, "utf-8"));
-      m.ship = {
-        slug,
-        repo: gitURL ? repo : null,
-        gitURL,
-        deployURL,
-        shippedAt: new Date().toISOString(),
-      };
-      fs.writeFileSync(mp, JSON.stringify(m, null, 2));
+      const m = JSON.parse(
+        fs.readFileSync(path.join(outDir, "data", "manifest.json"), "utf-8"),
+      );
+      if (m.url) hostname = new URL(m.url).hostname;
     } catch {}
   }
+  const slug =
+    flags.shipName ||
+    (flags.gitRepo && flags.gitRepo.split("/").pop()) ||
+    makeShipSlug(hostname);
+  const repo = flags.gitRepo || `allonelabs/${slug}`;
+  let gitURL = null;
+  let deployURL = null;
+  if (flags.pushGit) {
+    try {
+      gitURL = await shipToGit(outDir, repo);
+      console.log(`   🐙 git → ${gitURL}`);
+    } catch (e) {
+      console.log(
+        `   ⚠ git push failed: ${(e.stderr || e.message || "").toString().slice(0, 160)}`,
+      );
+    }
+  }
+  if (flags.deploy) {
+    try {
+      deployURL = await shipToVercel(outDir, slug);
+      console.log(`   ▲ vercel → ${deployURL}`);
+    } catch (e) {
+      console.log(
+        `   ⚠ vercel deploy failed: ${(e.stderr || e.message || "").toString().slice(0, 160)}`,
+      );
+    }
+  }
+  try {
+    const mp = path.join(outDir, "data", "manifest.json");
+    const m = JSON.parse(fs.readFileSync(mp, "utf-8"));
+    m.ship = {
+      slug,
+      repo: gitURL ? repo : null,
+      gitURL,
+      deployURL,
+      shippedAt: new Date().toISOString(),
+    };
+    fs.writeFileSync(mp, JSON.stringify(m, null, 2));
+  } catch {}
 }
 
 // ─── Ship helpers ──────────────────────────────────────────────────────
@@ -7842,7 +7997,9 @@ async function shipToGit(outDir, repo) {
   // Try to create the repo; if it already exists, fall back to add-remote+push.
   let createdNew = false;
   try {
-    run(`gh repo create ${repo} --public --source=. --push --remote=origin`, {
+    // Default to --private: clones are of 3rd-party content, public push
+    // would expose copyrighted assets. Toggle in code if you want public.
+    run(`gh repo create ${repo} --private --source=. --push --remote=origin`, {
       stdio: ["pipe", "pipe", "pipe"],
     });
     createdNew = true;
