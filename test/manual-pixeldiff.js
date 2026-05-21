@@ -26,6 +26,11 @@ const PIXEL_DIFF_SRC = require("fs")
   );
   console.log("pixelDiff result:", result);
   if (result.ratio < 0.5) throw new Error("Expected high pixel diff");
+  if (!("scale" in result) || !("mismatchedDimensions" in result)) {
+    throw new Error(
+      "pixelDiff result missing new scale/mismatchedDimensions fields",
+    );
+  }
   console.log("✅ pixelDiff smoke test passed");
   await browser.close();
 })();

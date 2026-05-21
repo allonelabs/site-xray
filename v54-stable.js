@@ -318,6 +318,7 @@ function resolveStableSelector(el) {
 }
 `;
 
+// NOTE: extracted by test/manual-pixeldiff.js via regex — do not rename this constant.
 // v54: In-browser canvas pixel-diff — both PNGs loaded as Image, drawn to OffscreenCanvas, diffed
 const PIXEL_DIFF_SRC = `
 async function pixelDiff(urlA, urlB, opts) {
@@ -369,7 +370,16 @@ async function pixelDiff(urlA, urlB, opts) {
       }
     }
   }
-  return { diffPx, totalPx: w * h, ratio: diffPx / (w * h), hotRegions };
+  return {
+    diffPx,
+    totalPx: w * h,
+    ratio: diffPx / (w * h),
+    hotRegions,
+    scale: w / Math.max(a.naturalWidth, b.naturalWidth),
+    originW: { a: a.naturalWidth, b: b.naturalWidth },
+    originH: { a: a.naturalHeight, b: b.naturalHeight },
+    mismatchedDimensions: (a.naturalWidth !== b.naturalWidth) || (a.naturalHeight !== b.naturalHeight),
+  };
 }
 `;
 
