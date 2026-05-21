@@ -5176,13 +5176,19 @@ ${stubFooter || ""}
 
   // v53 backport: Write capture errors log
   if (captureErrors.length > 0) {
-    fs.writeFileSync(
-      path.join(OUT, "data", "errors.json"),
-      JSON.stringify(captureErrors, null, 2),
-    );
-    console.log(
-      `     ⚠ ${captureErrors.length} capture errors logged to data/errors.json`,
-    );
+    try {
+      fs.writeFileSync(
+        path.join(OUT, "data", "errors.json"),
+        JSON.stringify(captureErrors, null, 2),
+      );
+      console.log(
+        `     ⚠ ${captureErrors.length} capture errors logged to data/errors.json`,
+      );
+    } catch (eErr) {
+      console.log(
+        `     ⚠ errors.json write failed: ${eErr.message?.slice(0, 60)}`,
+      );
+    }
   }
 
   // v53 backport: Structured manifest (will be extended by v54 verify phase)
