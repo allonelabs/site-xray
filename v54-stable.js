@@ -68,6 +68,18 @@ for (let i = 0; i < args.length; i++) {
     flags.debugReport = true;
   } else if (args[i] === "--responsive") {
     flags.responsive = true;
+  } else if (args[i] === "--push-git") {
+    flags.pushGit = true;
+    // Optional next arg = repo name (allonelabs/<name>); if it starts with
+    // "--" or is missing, auto-derive from the URL host.
+    if (args[i + 1] && !args[i + 1].startsWith("--")) flags.gitRepo = args[++i];
+  } else if (args[i] === "--deploy") {
+    flags.deploy = true;
+  } else if (args[i] === "--ship") {
+    flags.pushGit = true;
+    flags.deploy = true;
+  } else if (args[i] === "--ship-name") {
+    flags.shipName = args[++i];
   } else {
     positional.push(args[i]);
   }
@@ -100,6 +112,12 @@ Flags:
   --verify-budget <sec>    Cap verify-phase wall-clock per pass (default 300)
   --debug-report           Always emit debug-report.html
   --responsive             Capture desktop/tablet/mobile screenshots (v53 backport)
+
+# Ship
+  --push-git [repo]   git init/commit/push (creates allonelabs/<auto> if no repo)
+  --deploy            Deploy to Vercel (--scope=allonelabs --prod)
+  --ship              Both --push-git and --deploy
+  --ship-name <slug>  Override the auto-derived repo/project name
 
 Examples:
   node v54-stable.js https://example.com
@@ -7704,6 +7722,125 @@ ${stubFooter || ""}
   }
 
   await browser.close();
+
+  // Ship phase — optional. Runs only when one of --push-git, --deploy,
+  // --ship is set. Each operation is wrapped so a failure in git doesn't
+  // skip the deploy.
+  if (flags.pushGit || flags.deploy) {
+    console.log("\n🚀 Ship phase\n");
+    const slug =
+      flags.shipName ||
+      (flags.gitRepo && flags.gitRepo.split("/").pop()) ||
+      makeShipSlug(PARSED.hostname);
+    const repo = flags.gitRepo || `allonelabs/${slug}`;
+    let gitURL = null;
+    let deployURL = null;
+    if (flags.pushGit) {
+      try {
+        gitURL = await shipToGit(OUT, repo);
+        console.log(`   🐙 git → ${gitURL}`);
+      } catch (e) {
+        console.log(
+          `   ⚠ git push failed: ${(e.stderr || e.message || "").toString().slice(0, 160)}`,
+        );
+      }
+    }
+    if (flags.deploy) {
+      try {
+        deployURL = await shipToVercel(OUT, slug);
+        console.log(`   ▲ vercel → ${deployURL}`);
+      } catch (e) {
+        console.log(
+          `   ⚠ vercel deploy failed: ${(e.stderr || e.message || "").toString().slice(0, 160)}`,
+        );
+      }
+    }
+    // Write the ship URLs into manifest.json so they're discoverable later.
+    try {
+      const mp = path.join(OUT, "data", "manifest.json");
+      const m = JSON.parse(fs.readFileSync(mp, "utf-8"));
+      m.ship = {
+        slug,
+        repo: gitURL ? repo : null,
+        gitURL,
+        deployURL,
+        shippedAt: new Date().toISOString(),
+      };
+      fs.writeFileSync(mp, JSON.stringify(m, null, 2));
+    } catch {}
+  }
+}
+
+// ─── Ship helpers ──────────────────────────────────────────────────────
+function makeShipSlug(hostname) {
+  // www.kenkais.com → xray-kenkais-com; piranhabar.ie → xray-piranhabar-ie
+  return (
+    "xray-" +
+    hostname
+      .replace(/^www\./, "")
+      .replace(/[^a-z0-9]+/gi, "-")
+      .replace(/^-+|-+$/g, "")
+      .toLowerCase()
+      .slice(0, 50)
+  );
+}
+
+async function shipToGit(outDir, repo) {
+  const { execSync } = require("child_process");
+  const run = (cmd, opts = {}) =>
+    execSync(cmd, { cwd: outDir, encoding: "utf-8", ...opts }).trim();
+  // Idempotent .gitignore — avoid pushing massive playwright/node modules.
+  const gi = ["node_modules/\n", ".vercel/\n", "*.log\n"].join("");
+  const giPath = path.join(outDir, ".gitignore");
+  if (
+    !fs.existsSync(giPath) ||
+    !fs.readFileSync(giPath, "utf-8").includes("node_modules")
+  )
+    fs.writeFileSync(giPath, gi);
+
+  if (!fs.existsSync(path.join(outDir, ".git"))) {
+    run("git init -q");
+    try {
+      run("git symbolic-ref HEAD refs/heads/main");
+    } catch {}
+  }
+  run("git add -A");
+  try {
+    run(
+      'git -c user.email=site-xray@allonelabs.com -c user.name=site-xray commit -m "site-xray snapshot"',
+    );
+  } catch {
+    // Nothing to commit (re-shipping after a clean run) — keep going.
+  }
+  // Try to create the repo; if it already exists, fall back to add-remote+push.
+  let createdNew = false;
+  try {
+    run(`gh repo create ${repo} --public --source=. --push --remote=origin`, {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    createdNew = true;
+  } catch {
+    // Repo likely exists. Set remote (overwrite) and push.
+    try {
+      run("git remote remove origin", { stdio: ["pipe", "pipe", "pipe"] });
+    } catch {}
+    run(`git remote add origin https://github.com/${repo}.git`);
+    run("git push -u origin HEAD:main --force");
+  }
+  return `https://github.com/${repo}${createdNew ? "" : ""}`;
+}
+
+async function shipToVercel(outDir, slug) {
+  const { execSync } = require("child_process");
+  // --scope=allonelabs targets the team; --prod is a production deploy;
+  // --yes accepts the project-create prompt non-interactively; --name sets
+  // the slug. Output ends with the deploy URL on stdout.
+  const out = execSync(
+    `vercel --cwd "${outDir}" --scope=allonelabs --prod --yes --name "${slug}"`,
+    { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
+  );
+  const lines = out.trim().split("\n").filter(Boolean);
+  return lines[lines.length - 1];
 }
 
 main().catch((e) => {
