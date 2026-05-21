@@ -1198,11 +1198,12 @@ async function probeAnimationTrajectory(origPage, clonePage) {
 }
 
 async function sampleTrajectory(page, selector) {
-  // Window: 2s @ 200ms steps (was 5s @ 100ms = 50 samples per call). At 30
-  // selectors × 2 pages this dominated verify wall-clock; 2s × 10 samples is
-  // enough to detect typical CSS animation drift without watching loop-cycles
-  // play out twice.
-  return await page.evaluate(async (sel) => {
+  // Window: 2s @ 200ms steps. Wrapped in Promise.race with a 4s wall-clock
+  // (2s sample + 2s slack) because page.evaluate hangs indefinitely on
+  // heavy SPAs with GSAP+ScrollTrigger (bottega53). Returning null on
+  // timeout makes trajectoryDistance() return zero drift — i.e. we skip
+  // that selector cleanly instead of stalling the whole probe.
+  const evalPromise = page.evaluate(async (sel) => {
     const el = document.querySelector(sel);
     if (!el) return null;
     const samples = [];
@@ -1223,6 +1224,10 @@ async function sampleTrajectory(page, selector) {
     }
     return samples;
   }, selector);
+  return await Promise.race([
+    evalPromise.catch(() => null),
+    new Promise((resolve) => setTimeout(() => resolve(null), 4000)),
+  ]);
 }
 
 function trajectoryDistance(a, b) {
