@@ -3,21 +3,29 @@
 Take any URL. Get a faithful static clone you can host anywhere.
 
 ```bash
-# Full clone with verify+fix (Playwright)
-node v54-stable.js https://example.com
+# One command — auto-picks the right engine
+node xray-auto.js https://example.com
 
-# Fast HTTP-only clone (no Playwright — for SSR sites)
-node xray-static.js https://example.com
+# Or call an engine directly
+node v54-stable.js  https://example.com    # full Playwright path
+node xray-static.js https://example.com    # HTTP-only fast path
 ```
 
-Two clone engines:
+`xray-auto.js` HTTP-probes the URL, classifies the response, and dispatches:
 
-| Engine           | Speed       | Best for                                                                               |
-| ---------------- | ----------- | -------------------------------------------------------------------------------------- |
-| `v54-stable.js`  | seconds–min | SPAs, sites needing JS to render content, sites needing verify+fix loop                |
-| `xray-static.js` | 16× faster  | SSR Next.js, Astro, Hugo, plain HTML, WordPress-rendered — content arrives in raw HTML |
+| Engine             | When auto picks it                                                                                        | Speed                                     |
+| ------------------ | --------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| **xray-static.js** | response has ≥1KB visible text and no SPA shell pattern (SSR Next.js, Astro, Hugo, WordPress, plain HTML) | 16× faster, no Playwright                 |
+| **v54-stable.js**  | SPA shell (`<div id="__next">` etc.), too little text, or probe fails                                     | full Playwright clone + verify + fix loop |
 
-`xray-static` skips Playwright entirely. It HTTP-fetches the page, detects whether the response is "static-enough" (visible text > 1KB, no obvious SPA shell), then downloads assets in parallel and rewrites URLs. Tailwindcss.com benchmarks at **40s** with `xray-static` vs **11:46** with `v54-stable.js` and scores 2 points higher (`77/100` vs `75/100`) because raw SSR HTML is cleaner than a Playwright-captured post-hydration DOM. The trade-off: anti-bot CDN protections (Stripe-style) block raw HTTP — fall back to `v54-stable.js` for those.
+End-to-end benchmark (tailwindcss.com `--score`):
+
+|                           | Time     | Score      |
+| ------------------------- | -------- | ---------- |
+| `v54-stable.js`           | 12:36    | 75/100     |
+| `xray-auto.js` (→ static) | **1:39** | **78/100** |
+
+8× faster and 3 points higher on this site because raw SSR HTML is cleaner than a Playwright-captured post-hydration DOM. The Playwright engine is still needed for SPAs and for sites with anti-bot CDN protection (Stripe-style sites return 403 to raw HTTP).
 
 ## What it does
 
