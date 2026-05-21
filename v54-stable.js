@@ -498,9 +498,11 @@ async function runVerifyPhase(outDir, browser, flags) {
       waitUntil: "domcontentloaded",
       timeout: 15000,
     });
-    // Detectors will be called here in subsequent tasks
+    // v54 C1: interactionProbe — click detection
+    const issues = [];
+    issues.push(...(await probeClick(origPage, clonePage, flags)));
     return {
-      issues: [],
+      issues,
       origPage,
       clonePage,
       cleanup: async () => {
@@ -515,6 +517,203 @@ async function runVerifyPhase(outDir, browser, flags) {
     server.kill();
     throw e;
   }
+}
+
+// v54: interactionProbe — click detection (C1)
+// Walks a small set of candidate interactive selectors on the original page,
+// then calls observeClick on both pages. If the original "acted" (mutation,
+// open panel, or navigation) and the clone did not, push an issue.
+async function probeClick(origPage, clonePage, flags) {
+  const issues = [];
+  const timeoutMs = (flags && flags.interactionTimeout) || 3000;
+  let candidates = [];
+  try {
+    candidates = await origPage.evaluate(() => {
+      function resolveStableSelector(el) {
+        if (!el || el === document.body || el === document.documentElement) {
+          return el && el.tagName ? el.tagName.toLowerCase() : "body";
+        }
+        if (el.id) return "#" + CSS.escape(el.id);
+        if (el.dataset && el.dataset.testid)
+          return '[data-testid="' + el.dataset.testid + '"]';
+        const classes = (typeof el.className === "string" ? el.className : "")
+          .split(/\s+/)
+          .filter((c) => c && !/^(js-|is-|has-)/.test(c))
+          .slice(0, 3);
+        if (classes.length) {
+          const sel =
+            el.tagName.toLowerCase() +
+            "." +
+            classes.map((c) => CSS.escape(c)).join(".");
+          if (document.querySelectorAll(sel).length === 1) return sel;
+        }
+        const parent = el.parentElement;
+        if (!parent) return el.tagName.toLowerCase();
+        const siblings = Array.from(parent.children).filter(
+          (c) => c.tagName === el.tagName,
+        );
+        const idx = siblings.indexOf(el) + 1;
+        return (
+          resolveStableSelector(parent) +
+          " > " +
+          el.tagName.toLowerCase() +
+          ":nth-of-type(" +
+          idx +
+          ")"
+        );
+      }
+      const sels = [
+        "button",
+        "a[href]",
+        '[role="button"]',
+        '[role="link"]',
+        '[role="menuitem"]',
+        'input[type="submit"]',
+        'input[type="button"]',
+        "[onclick]",
+      ];
+      const out = [];
+      const seen = new Set();
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      for (const s of sels) {
+        const els = document.querySelectorAll(s);
+        for (const el of els) {
+          const r = el.getBoundingClientRect();
+          if (r.width < 4 || r.height < 4) continue;
+          if (r.bottom < 0 || r.top > vh || r.right < 0 || r.left > vw)
+            continue;
+          const sel = resolveStableSelector(el);
+          if (seen.has(sel)) continue;
+          seen.add(sel);
+          out.push(sel);
+        }
+      }
+      return out.slice(0, 50);
+    });
+  } catch (e) {
+    logCaptureError("probeClick:enumerate", e);
+    return issues;
+  }
+
+  for (const selector of candidates) {
+    try {
+      const origResult = await observeClick(origPage, selector, timeoutMs);
+      const cloneResult = await observeClick(clonePage, selector, timeoutMs);
+      if (origResult.missing || cloneResult.missing) continue;
+      const origActed =
+        origResult.mutationCount > 0 ||
+        origResult.openedPanel ||
+        origResult.navigated;
+      const cloneActed =
+        cloneResult.mutationCount > 0 ||
+        cloneResult.openedPanel ||
+        cloneResult.navigated;
+      if (origActed && !cloneActed) {
+        const type =
+          cloneResult.consoleErrors && cloneResult.consoleErrors.length
+            ? "click-throws"
+            : "click-no-op";
+        issues.push({
+          id: issueId(type, selector, { w: 1440, h: 900 }),
+          type,
+          selector,
+          viewport: { w: 1440, h: 900 },
+          evidence: {
+            origMutations: origResult.mutationCount,
+            origOpenedPanel: origResult.openedPanel,
+            origNavigated: origResult.navigated,
+            cloneMutations: cloneResult.mutationCount,
+            cloneOpenedPanel: cloneResult.openedPanel,
+            cloneNavigated: cloneResult.navigated,
+            cloneConsoleErrors: cloneResult.consoleErrors || [],
+          },
+          fixAttempts: 0,
+        });
+      }
+    } catch (e) {
+      logCaptureError(`probeClick:${selector}`, e);
+    }
+  }
+  return issues;
+}
+
+// v54: observeClick — runs in the page, installs a MutationObserver, counts
+// aria-expanded / data-state="open" elements before & after, clicks the
+// element, waits, and reports what changed.
+async function observeClick(page, selector, timeoutMs) {
+  const consoleErrors = [];
+  const onConsole = (msg) => {
+    if (msg.type() === "error") consoleErrors.push(msg.text().slice(0, 200));
+  };
+  let navigated = false;
+  const onNav = () => {
+    navigated = true;
+  };
+  page.on("console", onConsole);
+  page.on("framenavigated", onNav);
+  const wait = Math.min(Math.max(timeoutMs, 200), 5000);
+  const result = await page
+    .evaluate(
+      ({ selector, wait }) => {
+        return new Promise((resolve) => {
+          const el = document.querySelector(selector);
+          if (!el) {
+            resolve({
+              missing: true,
+              mutationCount: 0,
+              openedPanel: false,
+              navigated: false,
+            });
+            return;
+          }
+          let mutationCount = 0;
+          const obs = new MutationObserver((records) => {
+            mutationCount += records.length;
+          });
+          obs.observe(document.body, {
+            attributes: true,
+            childList: true,
+            subtree: true,
+            characterData: true,
+          });
+          const openBefore = document.querySelectorAll(
+            '[aria-expanded="true"], [data-state="open"]',
+          ).length;
+          try {
+            el.click();
+          } catch (e) {
+            /* swallow — surfaces via console listener */
+          }
+          setTimeout(() => {
+            const openAfter = document.querySelectorAll(
+              '[aria-expanded="true"], [data-state="open"]',
+            ).length;
+            obs.disconnect();
+            resolve({
+              missing: false,
+              mutationCount,
+              openedPanel: openAfter > openBefore,
+              navigated: false,
+            });
+          }, wait);
+        });
+      },
+      { selector, wait: Math.min(wait, 800) },
+    )
+    .catch(() => ({
+      missing: false,
+      mutationCount: 0,
+      openedPanel: false,
+      navigated: true,
+    }));
+  page.off("console", onConsole);
+  page.off("framenavigated", onNav);
+  return {
+    ...result,
+    navigated: result.navigated || navigated,
+    consoleErrors,
+  };
 }
 
 function pathToFile(p) {
@@ -3955,6 +4154,9 @@ async function main() {
       console.log(
         `Verify-only complete: ${result.issues.length} issues found.`,
       );
+      for (const it of result.issues) {
+        console.log(`   • ${it.type}  selector=${it.selector}`);
+      }
       await result.cleanup();
     } finally {
       await browser.close();
@@ -5559,6 +5761,9 @@ ${stubFooter || ""}
       console.log(
         `\n  🔬 v54 verify: ${result.issues.length} issues found (fix loop not yet implemented)`,
       );
+      for (const it of result.issues) {
+        console.log(`   • ${it.type}  selector=${it.selector}`);
+      }
       await result.cleanup();
     } catch (e) {
       console.log(`\n  ⚠ verify phase failed: ${e.message?.slice(0, 100)}`);

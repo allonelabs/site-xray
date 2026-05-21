@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Click fixture</title>
+  </head>
+  <body>
+    <button id="cta">Click me</button>
+    <div id="result"></div>
+    <script>
+      document.getElementById("cta").addEventListener("click", () => {
+        document.getElementById("result").textContent = "Clicked!";
+      });
+    </script>
+  </body>
+</html>
