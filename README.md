@@ -3,10 +3,21 @@
 Take any URL. Get a faithful static clone you can host anywhere.
 
 ```bash
+# Full clone with verify+fix (Playwright)
 node v54-stable.js https://example.com
+
+# Fast HTTP-only clone (no Playwright — for SSR sites)
+node xray-static.js https://example.com
 ```
 
-Produces a directory of HTML/CSS/JS/images/fonts/videos that renders pixel-equivalent to the original on a plain static host. Single file. One dependency (`playwright`). Zero config.
+Two clone engines:
+
+| Engine           | Speed       | Best for                                                                               |
+| ---------------- | ----------- | -------------------------------------------------------------------------------------- |
+| `v54-stable.js`  | seconds–min | SPAs, sites needing JS to render content, sites needing verify+fix loop                |
+| `xray-static.js` | 16× faster  | SSR Next.js, Astro, Hugo, plain HTML, WordPress-rendered — content arrives in raw HTML |
+
+`xray-static` skips Playwright entirely. It HTTP-fetches the page, detects whether the response is "static-enough" (visible text > 1KB, no obvious SPA shell), then downloads assets in parallel and rewrites URLs. Tailwindcss.com benchmarks at **40s** with `xray-static` vs **11:46** with `v54-stable.js` and scores 2 points higher (`77/100` vs `75/100`) because raw SSR HTML is cleaner than a Playwright-captured post-hydration DOM. The trade-off: anti-bot CDN protections (Stripe-style) block raw HTTP — fall back to `v54-stable.js` for those.
 
 ## What it does
 
@@ -135,12 +146,26 @@ clone-dir/
 - Local server start tries a port range so an orphan from a prior crash doesn't break the next run.
 - `urlMap` is persisted to `data/url-map.json` and consumed by fix injections so post-click HTML captured from live always uses the clone's local asset paths.
 
+## Multi-site benchmarks
+
+Scores measured by `score-clone.js` against the live origin (visual 35%, structural 15%, errors 15%, assets 15%, interactive 20%):
+
+| Site            | Engine          | Time    | Score      | Notes                                                          |
+| --------------- | --------------- | ------- | ---------- | -------------------------------------------------------------- |
+| example.com     | v54-stable      | 50s     | 98/100     | Sanity baseline                                                |
+| kenkais.com     | v54-stable      | 5min    | 94/100     | Mutation-replay fixes all 5 interactive panels                 |
+| tailwindcss.com | **xray-static** | **40s** | **77/100** | 16× faster, +2 points vs v54-stable (75/100 in 11:46)          |
+| bottega53.com   | v54-stable      | 5min    | 75/100     | GSAP+Lenis SPA; verify completes cleanly                       |
+| vercel.com      | v54-stable      | 21min   | 74/100     | --concurrency 3, 20 pages                                      |
+| stripe.com      | v54-stable      | 5min    | 70/100     | Anti-bot CDN blocks xray-static (3× faster but 222 assets 403) |
+
 ## Known limitations
 
 - **Interactive panels with stateful frameworks** (React/Vue stateful modals) replay a captured DOM snapshot; close-on-outside-click works, but state mutations after open aren't reactive.
 - **Animation-residue capture**: if the live site is mid-animation at capture time, transient inline styles may leak into the clone. The cleanup pass strips known patterns (lenis, `.pin-spacer`, sub-pixel translate residue, inline `opacity:0` on non-overlay elements).
 - **Heavy SPAs with multi-megabyte JS bundles** may have logic the static clone can't replay. Fix strategies cover common patterns (click-no-op, missing animation, broken form) — the rest are flagged in the debug report.
 - **Mobile-specific behaviors** (touch gestures, intersection observers, scroll-snap) aren't currently detected.
+- **Anti-bot CDN protection**: sites like Stripe block raw-HTTP user-agents (403). `xray-static` can't clone these; use `v54-stable.js` which carries a full Playwright browser fingerprint.
 
 ## Files
 
