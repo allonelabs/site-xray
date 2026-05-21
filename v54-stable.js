@@ -1302,7 +1302,9 @@ const FIX_STRATEGIES = {
     fixUndefinedGlobalInline,
     fixUndefinedGlobalStub,
   ],
-  // other types populated by D2-D5
+  "missing-hover": [fixMissingHover],
+  "missing-focus": [fixMissingFocus],
+  // other types populated by D3-D5
 };
 
 async function applyFix(issue, outDir, origPage, clonePage) {
@@ -1438,6 +1440,157 @@ async function fixUndefinedGlobalStub(issue, outDir, origPage, clonePage) {
   html = html.replace("<head>", "<head>" + stub);
   fs.writeFileSync(indexPath, html);
   return { ok: true, notes: `stubbed ${name} as no-op` };
+}
+
+// ─── css-pseudo strategies (D2) ───────────────────────────────────────
+// fixMissingPseudoClass — opens a CDP session against the live original page
+// for the given selector, forces the requested state pseudo-class (e.g.
+// "hover", "focus") via CSS.forcePseudoState so the engine surfaces the
+// matching rules, walks CSS.getMatchedStylesForNode → matchedCSSRules,
+// keeps rules whose selectorList text contains :PSEUDO, serializes the
+// source declarations back to CSS text, and injects them into the clone's
+// index.html. Idempotent via the v54-fix:${issue.id} sentinel.
+//
+// Note on CDP shape: state pseudo-classes (:hover, :focus, :focus-visible,
+// :active) are NOT exposed under `matched.pseudoElements` — that field is
+// for actual pseudo-elements (::before, ::after, ::first-line, ...). State
+// pseudo rules appear in `matchedCSSRules` only when the element is in
+// that state, which is why we call CSS.forcePseudoState first.
+async function fixMissingPseudoClass(
+  issue,
+  outDir,
+  origPage,
+  clonePage,
+  pseudo,
+) {
+  if (!issue.selector) return { ok: false, notes: "no selector on issue" };
+  const indexPath = path.join(outDir, "index.html");
+  if (!fs.existsSync(indexPath))
+    return { ok: false, notes: "index.html missing" };
+  let html = fs.readFileSync(indexPath, "utf-8");
+  const sentinel = `<!--v54-fix:${issue.id}-->`;
+  if (html.includes(sentinel)) return { ok: false, notes: "already attempted" };
+
+  let cdp;
+  try {
+    cdp = await origPage.context().newCDPSession(origPage);
+  } catch (e) {
+    return {
+      ok: false,
+      notes: `cdp session error: ${e.message?.slice(0, 80)}`,
+    };
+  }
+  let forcedNodeId = null;
+  try {
+    await cdp.send("DOM.enable");
+    await cdp.send("CSS.enable");
+    const { root } = await cdp.send("DOM.getDocument", { depth: -1 });
+    const { nodeId } = await cdp.send("DOM.querySelector", {
+      nodeId: root.nodeId,
+      selector: issue.selector,
+    });
+    if (!nodeId) return { ok: false, notes: "selector did not match in CDP" };
+    // Force the pseudo state so the engine returns rules that only match in
+    // that state. We release it in `finally` to leave the page clean.
+    try {
+      await cdp.send("CSS.forcePseudoState", {
+        nodeId,
+        forcedPseudoClasses: [pseudo],
+      });
+      forcedNodeId = nodeId;
+    } catch {
+      // some Chromium builds reject unknown pseudo strings — proceed anyway,
+      // we may still find the rule by selectorList text scan.
+    }
+    const matched = await cdp.send("CSS.getMatchedStylesForNode", { nodeId });
+    const pseudoToken = `:${pseudo}`;
+    const blocks = [];
+    for (const m of matched.matchedCSSRules || []) {
+      const rule = m.rule;
+      if (!rule || !rule.selectorList) continue;
+      // Only emit rules whose selectorList actually contains :PSEUDO — this
+      // skips the base ":not pseudo" rules that also match the forced node.
+      const selectors = rule.selectorList.selectors || [];
+      const pseudoSelectors = selectors
+        .map((s) => s.text || "")
+        .filter((t) => t.includes(pseudoToken));
+      if (pseudoSelectors.length === 0) continue;
+      const decls = (rule.style && rule.style.cssProperties) || [];
+      // Keep only declarations that have a source range — those are the
+      // author-written ones. Without this filter Chrome's longhand expansion
+      // (background-image:initial, border-top-color:..., etc.) would also
+      // ship into the clone and override unrelated styles.
+      const body = decls
+        .filter(
+          (d) =>
+            d.name &&
+            d.value !== undefined &&
+            d.value !== "" &&
+            d.range &&
+            d.disabled !== true,
+        )
+        .map(
+          (d) => `  ${d.name}: ${d.value}${d.important ? " !important" : ""};`,
+        )
+        .join("\n");
+      if (!body) continue;
+      blocks.push(`${pseudoSelectors.join(", ")} {\n${body}\n}`);
+    }
+    if (blocks.length === 0)
+      return { ok: false, notes: `no :${pseudo} rules found via CDP` };
+    const styleBlock = `\n${sentinel}\n<style data-v54-fix="${issue.id}">\n${blocks.join("\n")}\n</style>\n`;
+    if (html.includes("</head>")) {
+      html = html.replace("</head>", styleBlock + "</head>");
+    } else {
+      html = styleBlock + html;
+    }
+    fs.writeFileSync(indexPath, html);
+    return {
+      ok: true,
+      notes: `injected ${blocks.length} :${pseudo} rule(s) for ${issue.selector}`,
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      notes: `cdp pseudo extract failed: ${e.message?.slice(0, 80)}`,
+    };
+  } finally {
+    if (forcedNodeId !== null) {
+      try {
+        await cdp.send("CSS.forcePseudoState", {
+          nodeId: forcedNodeId,
+          forcedPseudoClasses: [],
+        });
+      } catch {}
+    }
+    try {
+      await cdp.detach();
+    } catch {}
+  }
+}
+
+async function fixMissingHover(issue, outDir, origPage, clonePage) {
+  return fixMissingPseudoClass(issue, outDir, origPage, clonePage, "hover");
+}
+
+async function fixMissingFocus(issue, outDir, origPage, clonePage) {
+  const first = await fixMissingPseudoClass(
+    issue,
+    outDir,
+    origPage,
+    clonePage,
+    "focus",
+  );
+  if (first.ok) return first;
+  // focus-visible is a separate pseudoType in CDP; try as a fallback so
+  // selectors that only define :focus-visible still get carried over.
+  return fixMissingPseudoClass(
+    issue,
+    outDir,
+    origPage,
+    clonePage,
+    "focus-visible",
+  );
 }
 
 // v54 D1: Minimal one-pass fix runner. Each call advances all issues by one strategy step.
