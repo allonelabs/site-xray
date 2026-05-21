@@ -759,12 +759,19 @@ async function probeClick(origPage, clonePage, flags) {
       const origResult = await observeClick(origPage, selector, timeoutMs);
       const cloneResult = await observeClick(clonePage, selector, timeoutMs);
       if (origResult.missing || cloneResult.missing) continue;
+      // v54: also treat large body-byte deltas as "acted". Snapshot-style
+      // fixes (mutation-replay router) do exactly one childList swap which
+      // falls below the mutationCount>=10 threshold, but the body grows by
+      // many KB — that's clearly action. score-clone.js uses the same dual
+      // signal for the same reason.
       const origActed =
         origResult.mutationCount >= 10 ||
+        (origResult.byteDelta || 0) >= 2000 ||
         origResult.openedPanel ||
         origResult.navigated;
       const cloneActed =
         cloneResult.mutationCount >= 10 ||
+        (cloneResult.byteDelta || 0) >= 2000 ||
         cloneResult.openedPanel ||
         cloneResult.navigated;
       if (origActed && !cloneActed) {
@@ -840,6 +847,7 @@ async function observeClick(page, selector, timeoutMs) {
           const openBefore = document.querySelectorAll(
             '[aria-expanded="true"], [data-state="open"]',
           ).length;
+          const beforeBytes = document.body.innerHTML.length;
           try {
             el.click();
           } catch (e) {
@@ -850,9 +858,11 @@ async function observeClick(page, selector, timeoutMs) {
               '[aria-expanded="true"], [data-state="open"]',
             ).length;
             obs.disconnect();
+            const afterBytes = document.body.innerHTML.length;
             resolve({
               missing: false,
               mutationCount,
+              byteDelta: Math.abs(afterBytes - beforeBytes),
               openedPanel: openAfter > openBefore,
               navigated: false,
             });
@@ -5257,6 +5267,32 @@ async function capturePage(page, urlPath, isFirst) {
         });
       } catch {}
       try {
+        // Strip inline opacity:0 animation-residue. These come from
+        // entrance animations mid-flight at capture time — without the JS
+        // to animate them to 1, they stay invisible forever. The CSS-
+        // default state is whatever the page's stylesheet says; trusting
+        // that is better than forcing visible at runtime (the old v24
+        // approach, which broke legitimate hover-reveal patterns).
+        const hoverRevealRE =
+          /(?:^|[-_])(info|caption|label|overlay|hover|reveal|meta|description|tooltip|hint|byline|tag)(?:$|[-_])/i;
+        const overlayClosestSel =
+          '[class*="modal"],[class*="Modal"],[class*="popup"],[class*="Popup"],[class*="overlay"],[class*="Overlay"],[role="dialog"],[class*="cookie"],[class*="Cookie"],[class*="consent"],[class*="banner"],[class*="dropdown"],[class*="Dropdown"],[class*="popover"],[class*="Popover"],[class*="flyout"],[class*="tooltip"],[class*="image-item__info"],[class*="category-item__info"],[class*="card-overlay"]';
+        document.querySelectorAll('[style*="opacity"]').forEach((el) => {
+          try {
+            const inline = el.style.opacity;
+            // We only care about explicitly-set 0 / "0.0" / etc.
+            if (!inline) return;
+            const v = parseFloat(inline);
+            if (!(v < 0.05)) return;
+            // Keep inline opacity:0 on elements that should be hidden:
+            const cls = (el.className || "").toString();
+            if (hoverRevealRE.test(cls)) return;
+            if (el.closest(overlayClosestSel)) return;
+            el.style.removeProperty("opacity");
+          } catch {}
+        });
+      } catch {}
+      try {
         // Strip subpixel-translate residue from inline transforms. These are
         // mid-frame ScrollTrigger/GSAP states that don't survive re-mount.
         // Recognized patterns:
@@ -7667,21 +7703,29 @@ ${stubFooter || ""}
     .catch(() => {});
   await origPage.close();
 
-  // Serve clone temporarily and screenshot it
+  // Serve clone temporarily and screenshot it. Try a range of ports so a
+  // leftover server (or concurrent run) doesn't kill us with EADDRINUSE.
   const { execSync: exec } = require("child_process");
   let cloneScreenshot = null;
+  let screenshotSrv = null;
+  let screenshotPort = null;
   try {
-    // Start temp server
-    const srv = require("child_process").spawn(
-      "python3",
-      ["-m", "http.server", "19876", "--directory", OUT],
-      { stdio: "pipe", detached: true },
-    );
+    for (let p = 19900; p < 19950; p++) {
+      if (await probePort(p)) continue;
+      screenshotPort = p;
+      screenshotSrv = require("child_process").spawn(
+        "python3",
+        ["-m", "http.server", String(p), "--directory", OUT],
+        { stdio: "pipe", detached: true },
+      );
+      break;
+    }
+    if (!screenshotPort) throw new Error("no free port for screenshot");
     await new Promise((r) => setTimeout(r, 1500));
 
     const clonePage = await context.newPage();
     await clonePage
-      .goto("http://localhost:19876", {
+      .goto(`http://localhost:${screenshotPort}`, {
         waitUntil: "domcontentloaded",
         timeout: 15000,
       })
@@ -7695,10 +7739,10 @@ ${stubFooter || ""}
 
     // Kill temp server
     try {
-      process.kill(-srv.pid);
+      process.kill(-screenshotSrv.pid);
     } catch (e) {
       try {
-        srv.kill();
+        screenshotSrv.kill();
       } catch (e2) {}
     }
   } catch (e) {
