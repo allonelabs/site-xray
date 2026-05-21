@@ -42,10 +42,62 @@ const REQ_HEADERS = {
 };
 const MAX_ASSET_BYTES = 50 * 1024 * 1024; // 50MB cap per asset
 const REQ_TIMEOUT_MS = 15000;
-const CONCURRENCY = 12; // parallel downloads
+const CONCURRENCY = 12; // default parallel downloads
 const STATIC_TEXT_THRESHOLD = 1024; // bytes of visible text needed to call it static
 
-function fetchURL(url, redirects = 0) {
+// ─── Adaptive rate limiter ─────────────────────────────────────────────
+// Stay fast (parallel) by default. Watch every response for blockage
+// signals — 429 / 503 / 403 / repeated timeouts / ECONNRESET. After
+// `BLOCK_THRESHOLD` signals from one origin, switch to serial mode
+// (concurrency=1, 500ms spacing) for the rest of the session. Manual
+// override via --rate <N> always wins. --rate 1 forces serial; --rate
+// 12 forces parallel (no adaptive downgrade).
+const rateState = {
+  forced: null, // user-set effective concurrency (null = adaptive)
+  current: CONCURRENCY,
+  blockedResponses: 0,
+  blockedHosts: new Set(),
+  totalFetches: 0,
+  spaceMs: 0, // sleep between fetches in serial mode
+};
+const BLOCK_THRESHOLD = 3;
+function effectiveConcurrency() {
+  if (rateState.forced !== null) return rateState.forced;
+  return rateState.current;
+}
+function recordResponse(status, err, host) {
+  rateState.totalFetches++;
+  const blocked =
+    status === 429 ||
+    status === 503 ||
+    status === 403 ||
+    (err && /ECONNRESET|timeout|EAI_AGAIN/i.test(String(err.message || err)));
+  if (blocked) {
+    rateState.blockedResponses++;
+    if (host) rateState.blockedHosts.add(host);
+    if (
+      rateState.forced === null &&
+      rateState.blockedResponses >= BLOCK_THRESHOLD &&
+      rateState.current > 1
+    ) {
+      rateState.current = 1;
+      rateState.spaceMs = 500;
+      console.log(
+        `  ⚠ rate-limit detected (${rateState.blockedResponses} blocked responses from ${[...rateState.blockedHosts].join(", ")}) — switching to serial mode (500ms spacing). Use --rate <N> to force a specific level.`,
+      );
+    }
+  }
+}
+async function maybeSpace() {
+  if (rateState.spaceMs > 0)
+    await new Promise((r) => setTimeout(r, rateState.spaceMs));
+}
+
+async function fetchURL(url, redirects = 0) {
+  // Honor adaptive spacing before each fetch (only set when blockage detected
+  // or --rate forces serial). When operating in parallel mode rateState.spaceMs
+  // is 0 and this is a no-op.
+  await maybeSpace();
   return new Promise((resolve, reject) => {
     if (redirects > 5) return reject(new Error("too many redirects"));
     let mod;
@@ -56,11 +108,12 @@ function fetchURL(url, redirects = 0) {
     } catch (e) {
       return reject(e);
     }
+    const host = parsed.host;
     const req = mod.get(
       url,
       { headers: REQ_HEADERS, timeout: REQ_TIMEOUT_MS },
       (res) => {
-        // Handle redirects
+        recordResponse(res.statusCode, null, host);
         if (
           res.statusCode >= 300 &&
           res.statusCode < 400 &&
@@ -91,13 +144,21 @@ function fetchURL(url, redirects = 0) {
             body: Buffer.concat(chunks),
           }),
         );
-        res.on("error", reject);
+        res.on("error", (e) => {
+          recordResponse(0, e, host);
+          reject(e);
+        });
       },
     );
-    req.on("error", reject);
+    req.on("error", (e) => {
+      recordResponse(0, e, host);
+      reject(e);
+    });
     req.on("timeout", () => {
       req.destroy();
-      reject(new Error(`timeout ${REQ_TIMEOUT_MS}ms: ${url}`));
+      const e = new Error(`timeout ${REQ_TIMEOUT_MS}ms: ${url}`);
+      recordResponse(0, e, host);
+      reject(e);
     });
   });
 }
@@ -243,7 +304,13 @@ async function downloadAll(absURLs, outDir, urlMap, kindByURL) {
   let failed = 0;
   const queue = [...absURLs];
   const workers = [];
-  for (let i = 0; i < CONCURRENCY; i++) {
+  // Honor the (adaptive or forced) concurrency at LAUNCH time. If rate-
+  // limiting kicks in mid-download, in-flight workers each see the new
+  // rateState.spaceMs sleep via maybeSpace() on their next fetch. Workers
+  // started here keep running but each fetch is throttled. This is simpler
+  // than a dynamic worker count and good enough for adaptive behavior.
+  const initialConcurrency = Math.max(1, effectiveConcurrency());
+  for (let i = 0; i < initialConcurrency; i++) {
     workers.push(
       (async () => {
         while (queue.length > 0) {
@@ -624,10 +691,31 @@ async function enumeratePages(html, baseURL) {
 async function main() {
   const args = process.argv.slice(2);
   const force = args.includes("--force");
-  const positional = args.filter((a) => !a.startsWith("--"));
+  // --rate <N>: manual concurrency override (1 = serial, 12 = default parallel).
+  // When set, the adaptive downgrade does NOT fire — user is in charge.
+  const rateIdx = args.indexOf("--rate");
+  if (rateIdx >= 0 && args[rateIdx + 1]) {
+    const n = parseInt(args[rateIdx + 1]);
+    if (Number.isFinite(n) && n > 0) {
+      rateState.forced = Math.min(32, n);
+      rateState.current = rateState.forced;
+      if (rateState.forced === 1) rateState.spaceMs = 250;
+    }
+  }
+  const positional = args.filter(
+    (a, i) => !a.startsWith("--") && !(i > 0 && args[i - 1] === "--rate"),
+  );
   if (positional.length < 1) {
     console.log(
-      `xray-static — HTTP-only clone for static-rendered sites.\n\nUsage: node xray-static.js <url> [out-dir] [max-pages] [--force]\n\nDefaults: out-dir=/tmp/xray-static-<host>, max-pages=20.\nUse --force to clone even if the site looks like an SPA shell.`,
+      `xray-static — HTTP-only clone for static-rendered sites.
+
+Usage: node xray-static.js <url> [out-dir] [max-pages] [--force] [--rate <N>]
+
+Defaults: out-dir=/tmp/xray-static-<host>, max-pages=20.
+--force        Clone even if the site looks like a SPA shell.
+--rate <N>     Force concurrency (1 = serial w/ 250ms spacing, 12 = parallel).
+               Without --rate the tool stays parallel and only downgrades to
+               serial after detecting rate-limiting (429/503/403/timeouts).`,
     );
     process.exit(1);
   }
@@ -639,7 +727,9 @@ async function main() {
 
   console.log(`\n🩻 xray-static`);
   console.log(`   ${targetURL} → ${outDir}`);
-  console.log(`   max-pages: ${maxPages}\n`);
+  console.log(
+    `   max-pages: ${maxPages}${rateState.forced !== null ? `, rate: ${rateState.forced}` : ""}\n`,
+  );
 
   fs.mkdirSync(outDir, { recursive: true });
   const t0 = Date.now();
