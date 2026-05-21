@@ -1448,6 +1448,86 @@ async function runUntilClean(outDir, browser, flags) {
   return { stopReason, history, finalIssues };
 }
 
+// v54 E3: writeDebugReport — generate HTML report at data/debug-report.html
+// showing each unfixable issue with side-by-side screenshots. For
+// visual-drift-animated issues with a frame dir, embeds a CSS @keyframes
+// block that swaps `background-image` across the captured frames —
+// implements animation playback without ffmpeg.
+//
+// Returns silently when finalIssues is empty AND !flags.debugReport (no
+// report on clean runs unless explicitly requested).
+function writeDebugReport(outDir, loopResult, flags) {
+  const issues = loopResult.finalIssues;
+  if (issues.length === 0 && !flags.debugReport) return;
+  const cards = issues
+    .map((issue) => {
+      const origImg = issue.evidence?.screenshotOrig
+        ? `<img src="${issue.evidence.screenshotOrig}" alt="original"/>`
+        : "<em>no screenshot</em>";
+      const cloneImg = issue.evidence?.screenshotClone
+        ? `<img src="${issue.evidence.screenshotClone}" alt="clone"/>`
+        : "<em>no screenshot</em>";
+      let animBlock = "";
+      if (issue.type === "visual-drift-animated") {
+        const frameDir = `data/issues/${issue.id}-anim`;
+        const fullFrameDir = path.join(outDir, frameDir);
+        if (fs.existsSync(fullFrameDir)) {
+          const frames = fs
+            .readdirSync(fullFrameDir)
+            .filter((f) => f.startsWith("orig-"))
+            .sort();
+          if (frames.length > 0) {
+            animBlock = `
+<div class="anim-pair">
+  <div class="anim-side" style="background-image:url('${frameDir}/${frames[0]}');animation:v54-anim-${issue.id} 5s steps(${frames.length}) infinite"></div>
+  <style>@keyframes v54-anim-${issue.id} {
+${frames.map((f, i) => `  ${((i / frames.length) * 100).toFixed(1)}% { background-image: url('${frameDir}/${f}'); }`).join("\n")}
+  }</style>
+</div>`;
+          }
+        }
+      }
+      return `
+<div class="issue">
+  <h3>${escapeHtml(issue.type)}: <code>${escapeHtml(issue.selector || "(page-level)")}</code></h3>
+  <p>${escapeHtml(issue.evidence?.originalBehavior || "")} → ${escapeHtml(issue.evidence?.cloneBehavior || "")}</p>
+  <p>Fix attempts: ${issue.fixAttempts}. Strategy: <code>${escapeHtml(issue.fixStrategy)}</code></p>
+  <div class="pair"><div>Original<br>${origImg}</div><div>Clone<br>${cloneImg}</div></div>
+  ${animBlock}
+</div>`;
+    })
+    .join("\n");
+  const html = `<!DOCTYPE html>
+<html><head><title>v54 debug report</title>
+<style>
+body { font-family: -apple-system, system-ui, sans-serif; max-width: 1200px; margin: 2em auto; padding: 0 1em; }
+.issue { border: 1px solid #ddd; border-radius: 8px; padding: 1em; margin: 1em 0; }
+.issue h3 { margin: 0 0 .5em; }
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 1em; }
+.pair img { max-width: 100%; border: 1px solid #ccc; }
+.anim-pair { margin-top: 1em; }
+.anim-side { width: 100%; height: 200px; background-size: contain; background-repeat: no-repeat; background-position: center; border: 1px solid #ccc; }
+code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; }
+</style></head>
+<body>
+<h1>v54 debug report</h1>
+<p>Final status: <strong>${escapeHtml(loopResult.stopReason)}</strong>. Passes: ${loopResult.history.length}. Unfixable issues: ${issues.length}.</p>
+${cards}
+</body></html>`;
+  fs.writeFileSync(path.join(outDir, "data", "debug-report.html"), html);
+  console.log(`     📊 Debug report: data/debug-report.html`);
+}
+
+function escapeHtml(s) {
+  return String(s || "").replace(
+    /[&<>"']/g,
+    (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
+        c
+      ],
+  );
+}
+
 // ─── click-no-op strategies ───────────────────────────────────────────
 
 async function fixClickReinjectHandler(issue, outDir, origPage, clonePage) {
@@ -5612,6 +5692,8 @@ async function main() {
       for (const it of loopResult.finalIssues) {
         console.log(`   • ${it.type}  selector=${it.selector}`);
       }
+      // v54 E3: debug-report.html for unfixable issues (or always with --debug-report).
+      writeDebugReport(targetDir, loopResult, flags);
     } finally {
       await browser.close();
     }
@@ -7229,6 +7311,8 @@ ${stubFooter || ""}
           `\n  ⚠ could not update manifest.json: ${e.message?.slice(0, 100)}`,
         );
       }
+      // v54 E3: debug-report.html for unfixable issues (or always with --debug-report).
+      writeDebugReport(OUT, loopResult, flags);
     } catch (e) {
       console.log(`\n  ⚠ verify phase failed: ${e.message?.slice(0, 100)}`);
     }
