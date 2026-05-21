@@ -311,6 +311,98 @@ function resolveStableSelector(el) {
 }
 `;
 
+// v54: Local-server lifecycle for serving the clone during verify
+const { spawn } = require("child_process");
+function startLocalServer(dir, port = 19876) {
+  const srv = spawn(
+    "python3",
+    ["-m", "http.server", String(port), "--directory", dir],
+    { stdio: "pipe", detached: true },
+  );
+  return new Promise((resolve, reject) => {
+    let resolved = false;
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        reject(new Error("local server start timeout"));
+      }
+    }, 5000);
+    // Wait for port — simplest signal: 1.5s delay (matches v52's pattern)
+    setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        resolve({
+          url: `http://localhost:${port}`,
+          kill: () => {
+            try {
+              process.kill(-srv.pid);
+            } catch {
+              try {
+                srv.kill();
+              } catch {}
+            }
+          },
+        });
+      }
+    }, 1500);
+  });
+}
+
+// v54: Top-level verify phase entrypoint (called from main after clone)
+async function runVerifyPhase(outDir, browser, flags) {
+  let originUrl;
+  try {
+    const m = JSON.parse(
+      fs.readFileSync(path.join(outDir, "data", "manifest.json"), "utf-8"),
+    );
+    originUrl = m.url;
+  } catch {}
+  if (!originUrl && typeof DOMAIN !== "undefined") originUrl = DOMAIN;
+  if (!originUrl) {
+    throw new Error(
+      "runVerifyPhase: could not determine origin URL (no manifest.json and no DOMAIN in scope)",
+    );
+  }
+  const server = await startLocalServer(outDir);
+  const context = await browser.newContext({
+    ignoreHTTPSErrors: true,
+    viewport: { width: 1440, height: 900 },
+  });
+  const cloneContext = await browser.newContext({
+    ignoreHTTPSErrors: true,
+    viewport: { width: 1440, height: 900 },
+  });
+  const origPage = await context.newPage();
+  const clonePage = await cloneContext.newPage();
+  try {
+    await origPage.goto(originUrl, {
+      waitUntil: "networkidle",
+      timeout: 20000,
+    });
+    await clonePage.goto(server.url, {
+      waitUntil: "domcontentloaded",
+      timeout: 15000,
+    });
+    // Detectors will be called here in subsequent tasks
+    return {
+      issues: [],
+      origPage,
+      clonePage,
+      cleanup: async () => {
+        await context.close();
+        await cloneContext.close();
+        server.kill();
+      },
+    };
+  } catch (e) {
+    await context.close().catch(() => {});
+    await cloneContext.close().catch(() => {});
+    server.kill();
+    throw e;
+  }
+}
+
 function pathToFile(p) {
   p = p || "/";
   if (p.endsWith("/")) p += "index.html";
@@ -3734,6 +3826,28 @@ async function discoverFromSitemap(domain) {
 // MAIN
 // ═══════════════════════════════════════
 async function main() {
+  // v54: --verify-only short-circuit (skip clone, run verify on existing dir)
+  if (flags.verifyOnly) {
+    const targetDir = flags.verifyOnly;
+    if (!fs.existsSync(targetDir)) {
+      console.error(`--verify-only: directory not found: ${targetDir}`);
+      process.exit(1);
+    }
+    const browser = await chromium.launch({
+      headless: !flags.interactive,
+    });
+    try {
+      const result = await runVerifyPhase(targetDir, browser, flags);
+      console.log(
+        `Verify-only complete: ${result.issues.length} issues found.`,
+      );
+      await result.cleanup();
+    } finally {
+      await browser.close();
+    }
+    return;
+  }
+
   for (const d of [
     "images",
     "fonts",
@@ -5323,6 +5437,19 @@ ${stubFooter || ""}
   if (issues.length)
     console.log(`   ⚠️  ${issues.length} verification warnings`);
   console.log(`\n   cd ${OUT} && python3 -m http.server 3035\n`);
+
+  // v54: Verify + fix loop (skip if --no-verify)
+  if (!flags.noVerify) {
+    try {
+      const result = await runVerifyPhase(OUT, browser, flags);
+      console.log(
+        `\n  🔬 v54 verify: ${result.issues.length} issues found (fix loop not yet implemented)`,
+      );
+      await result.cleanup();
+    } catch (e) {
+      console.log(`\n  ⚠ verify phase failed: ${e.message?.slice(0, 100)}`);
+    }
+  }
 
   await browser.close();
 }
