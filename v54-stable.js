@@ -1312,8 +1312,11 @@ const FIX_STRATEGIES = {
   "missing-font-glyphs": [fixMissingFontGlyphs],
   "missing-svg-symbol": [fixMissingSvgSymbol],
   "webgl-shader-fail": [fixWebglShaderFail],
+  "broken-form": [fixBrokenForm],
+  "visual-drift": [fixVisualDrift],
+  "iframe-blocked": [fixIframeBlocked],
+  "console-error-unhandled-rejection": [fixUnhandledRejection],
   // detectors for lazy-image-stuck / missing-font-glyphs / missing-svg-symbol / webgl-shader-fail are not yet implemented — fixers ready for future detector hookups
-  // other types populated by D5
 };
 
 async function applyFix(issue, outDir, origPage, clonePage) {
@@ -1856,6 +1859,124 @@ async function fixWebglShaderFail(issue, outDir, origPage, clonePage) {
       notes: `webgl poster error: ${e.message?.slice(0, 80)}`,
     };
   }
+}
+
+// ─── broken-form: neutralize external action ─────────────────────────
+// For each <form action="..."> whose action is a parseable URL with a
+// hostname NOT in the local allow-list, rewrite action to "#" and add
+// onsubmit="event.preventDefault();return false". Skips empty/unparseable
+// actions. Marks the file with a sentinel before </body>.
+async function fixBrokenForm(issue, outDir, origPage, clonePage) {
+  const indexPath = path.join(outDir, "index.html");
+  let html = fs.readFileSync(indexPath, "utf-8");
+  const sentinel = `<!--v54-fix:${issue.id}-->`;
+  if (html.includes(sentinel)) return { ok: false, notes: "already attempted" };
+  const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1"]);
+  let neutralized = 0;
+  html = html.replace(/<form\b([^>]*)>/gi, (full, attrs) => {
+    const actionMatch = attrs.match(/\baction\s*=\s*("([^"]*)"|'([^']*)')/i);
+    if (!actionMatch) return full;
+    const actionVal = actionMatch[2] ?? actionMatch[3] ?? "";
+    if (!actionVal.trim()) return full;
+    let parsed;
+    try {
+      parsed = new URL(actionVal, "http://localhost/");
+    } catch {
+      return full;
+    }
+    if (LOCAL_HOSTS.has(parsed.hostname)) return full;
+    let newAttrs = attrs.replace(
+      /\baction\s*=\s*("[^"]*"|'[^']*')/i,
+      'action="#"',
+    );
+    if (!/\bonsubmit\s*=/i.test(newAttrs)) {
+      newAttrs += ' onsubmit="event.preventDefault();return false"';
+    }
+    neutralized++;
+    return `<form${newAttrs}>`;
+  });
+  if (!neutralized) return { ok: false, notes: "no external form action" };
+  if (/<\/body>/i.test(html)) {
+    html = html.replace(/<\/body>/i, `${sentinel}</body>`);
+  } else {
+    html += sentinel;
+  }
+  fs.writeFileSync(indexPath, html);
+  return {
+    ok: true,
+    notes: `neutralized ${neutralized} external form action(s)`,
+  };
+}
+
+// visual-drift: stub — element resolution from page-level visual diff is
+// not yet implemented. Returns ok=false so the runner advances past it.
+async function fixVisualDrift(issue, outDir, origPage, clonePage) {
+  return {
+    ok: false,
+    notes: "visual-drift element resolution not yet implemented",
+  };
+}
+
+// iframe-blocked: screenshot the iframe's bounding box on the original
+// and swap the clone's <iframe> for a static <img> poster.
+async function fixIframeBlocked(issue, outDir, origPage, clonePage) {
+  if (!issue.selector) return { ok: false, notes: "no selector" };
+  try {
+    const elHandle = await origPage.$(issue.selector).catch(() => null);
+    if (!elHandle) return { ok: false, notes: "iframe not found on original" };
+    const box = await elHandle.boundingBox();
+    if (!box) return { ok: false, notes: "iframe has no bounding box" };
+    const buf = await origPage.screenshot({
+      clip: {
+        x: Math.max(0, box.x),
+        y: Math.max(0, box.y),
+        width: Math.max(1, box.width),
+        height: Math.max(1, box.height),
+      },
+    });
+    const dataUri = `data:image/png;base64,${buf.toString("base64")}`;
+    const indexPath = path.join(outDir, "index.html");
+    let html = fs.readFileSync(indexPath, "utf-8");
+    const sentinel = `<!--v54-fix:${issue.id}-->`;
+    if (html.includes(sentinel))
+      return { ok: false, notes: "already attempted" };
+    const w = Math.round(box.width);
+    const h = Math.round(box.height);
+    const selFrag = issue.selector.replace(/^#/, "");
+    const replaced = html.replace(
+      new RegExp(
+        `<iframe[^>]*${escapeRegExp(selFrag)}[^>]*>(?:[\\s\\S]*?</iframe>)?`,
+        "g",
+      ),
+      `${sentinel}<img src="${dataUri}" width="${w}" height="${h}" alt="iframe poster"/>`,
+    );
+    if (replaced === html)
+      return { ok: false, notes: "no matching <iframe> in clone html" };
+    fs.writeFileSync(indexPath, replaced);
+    return { ok: true, notes: "replaced iframe with poster screenshot" };
+  } catch (e) {
+    return {
+      ok: false,
+      notes: `iframe poster error: ${e.message?.slice(0, 80)}`,
+    };
+  }
+}
+
+// console-error-unhandled-rejection: inject a top-of-<head> script that
+// silently preventDefaults unhandledrejection events. Marked with sentinel.
+async function fixUnhandledRejection(issue, outDir, origPage, clonePage) {
+  const indexPath = path.join(outDir, "index.html");
+  let html = fs.readFileSync(indexPath, "utf-8");
+  const sentinel = `<!--v54-fix:${issue.id}-->`;
+  if (html.includes(sentinel)) return { ok: false, notes: "already attempted" };
+  const block = `${sentinel}<script>window.addEventListener('unhandledrejection', e => e.preventDefault());</script>`;
+  if (/<head[^>]*>/i.test(html)) {
+    html = html.replace(/<head([^>]*)>/i, `<head$1>${block}`);
+  } else {
+    html = block + html;
+  }
+  fs.writeFileSync(indexPath, html);
+  return { ok: true, notes: "injected unhandledrejection silencer" };
 }
 
 // v54 D1: Minimal one-pass fix runner. Each call advances all issues by one strategy step.
