@@ -419,7 +419,19 @@ function probePort(port, host = "127.0.0.1") {
   });
 }
 
-function startLocalServer(dir, port = 19876) {
+async function startLocalServer(dir, basePort = 19876) {
+  // Find a free port in [basePort, basePort+50). Orphan servers from prior
+  // runs (or other processes) used to crash this hard with a hardcoded port.
+  let port = basePort;
+  for (; port < basePort + 50; port++) {
+    if (!(await probePort(port))) break;
+  }
+  if (port >= basePort + 50)
+    throw new Error(`no free port in [${basePort}, ${basePort + 50})`);
+  return startLocalServerOnPort(dir, port);
+}
+
+function startLocalServerOnPort(dir, port) {
   // NOTE: `detached: true` and `process.kill(-srv.pid)` below are paired —
   // detached makes the child a process-group leader so we can signal the
   // whole group via the negative pid. Drop one without the other and
@@ -515,15 +527,30 @@ async function runVerifyPhase(outDir, browser, flags) {
   // strictest wait first, fall back to looser ones with backoff before giving
   // up. Total budget ~75s per page (still fast enough; was 20s before).
   async function gotoResilient(page, url, label) {
+    // Each attempt is also wrapped in a wall-clock Promise.race because we
+    // saw Playwright's own timeout fail to fire in pathological cases
+    // (bottega53.com hung the second attempt for 30+ minutes). The wall-
+    // clock buffer is timeout + 5s, so Playwright still wins normally.
     const attempts = [
-      { waitUntil: "networkidle", timeout: 30000 },
-      { waitUntil: "load", timeout: 25000 },
-      { waitUntil: "domcontentloaded", timeout: 20000 },
+      { waitUntil: "networkidle", timeout: 25000 },
+      { waitUntil: "load", timeout: 20000 },
+      { waitUntil: "domcontentloaded", timeout: 15000 },
     ];
+    const withDeadline = (p, ms, why) =>
+      Promise.race([
+        p,
+        new Promise((_, rej) =>
+          setTimeout(() => rej(new Error(`wall-clock ${ms}ms: ${why}`)), ms),
+        ),
+      ]);
     let lastErr;
     for (let k = 0; k < attempts.length; k++) {
       try {
-        await page.goto(url, attempts[k]);
+        await withDeadline(
+          page.goto(url, attempts[k]),
+          attempts[k].timeout + 5000,
+          `${label} ${attempts[k].waitUntil}`,
+        );
         return;
       } catch (e) {
         lastErr = e;
