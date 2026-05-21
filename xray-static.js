@@ -617,6 +617,71 @@ async function probeNextBuildManifest(origin, html) {
   }
 }
 
+// HEAD-check each enumerated route — drop 4xx/5xx so we don't waste a
+// full fetch on dead URLs (sitemap entries for deleted posts, draft pages,
+// 410 Gone, etc.). Concurrency honors the (adaptive or forced) rate state.
+// Some servers don't support HEAD — we treat 405/501 as "live" since the
+// failure is method-specific, not URL-specific.
+function headCheck(url) {
+  return new Promise((resolve) => {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return resolve({ ok: false });
+    }
+    const mod = parsed.protocol === "http:" ? http : https;
+    const opts = {
+      method: "HEAD",
+      headers: REQ_HEADERS,
+      timeout: 8000,
+      protocol: parsed.protocol,
+      hostname: parsed.hostname,
+      port: parsed.port,
+      path: parsed.pathname + parsed.search,
+    };
+    const req = mod.request(opts, (res) => {
+      const status = res.statusCode;
+      const ok = status < 400 || status === 405 || status === 501;
+      res.resume();
+      recordResponse(status, null, parsed.host);
+      resolve({ ok, status });
+    });
+    req.on("error", () => resolve({ ok: false, status: 0 }));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve({ ok: false, status: 0 });
+    });
+    req.end();
+  });
+}
+
+async function validateRoutes(baseURL, routes) {
+  const live = [];
+  const dead = [];
+  const queue = [...routes];
+  const concurrency = Math.max(1, effectiveConcurrency());
+  const workers = [];
+  for (let i = 0; i < concurrency; i++) {
+    workers.push(
+      (async () => {
+        while (queue.length > 0) {
+          const p = queue.shift();
+          if (!p) break;
+          const url = new URL(p, baseURL).toString();
+          const res = await headCheck(url);
+          if (res.ok) live.push(p);
+          else dead.push({ p, status: res.status });
+        }
+      })(),
+    );
+  }
+  await Promise.all(workers);
+  // Preserve original priority order
+  const liveSet = new Set(live);
+  return routes.filter((p) => liveSet.has(p));
+}
+
 async function enumeratePages(html, baseURL) {
   const origin = new URL(baseURL).origin;
   // Route → priority score. Higher = more important. When max-pages clips
@@ -718,6 +783,7 @@ async function enumeratePages(html, baseURL) {
 async function main() {
   const args = process.argv.slice(2);
   const force = args.includes("--force");
+  const validate = args.includes("--validate");
   // --rate <N>: manual concurrency override (1 = serial, 12 = default parallel).
   // When set, the adaptive downgrade does NOT fire — user is in charge.
   const rateIdx = args.indexOf("--rate");
@@ -736,13 +802,16 @@ async function main() {
     console.log(
       `xray-static — HTTP-only clone for static-rendered sites.
 
-Usage: node xray-static.js <url> [out-dir] [max-pages] [--force] [--rate <N>]
+Usage: node xray-static.js <url> [out-dir] [max-pages] [--force] [--rate <N>] [--validate]
 
 Defaults: out-dir=/tmp/xray-static-<host>, max-pages=20.
 --force        Clone even if the site looks like a SPA shell.
 --rate <N>     Force concurrency (1 = serial w/ 250ms spacing, 12 = parallel).
                Without --rate the tool stays parallel and only downgrades to
-               serial after detecting rate-limiting (429/503/403/timeouts).`,
+               serial after detecting rate-limiting (429/503/403/timeouts).
+--validate     HEAD-check each enumerated route before crawling; drop 4xx/5xx
+               URLs. Catches dead sitemap entries / draft posts before we
+               waste a full fetch on them.`,
     );
     process.exit(1);
   }
@@ -791,9 +860,13 @@ Defaults: out-dir=/tmp/xray-static-<host>, max-pages=20.
   // of HTTP hops worth of HTML-link discovery.
   const framework = detectFramework(homeHTML);
   if (framework) console.log(`  🔍 framework: ${framework.kind}`);
-  const seedRoutes = await enumeratePages(homeHTML, targetURL);
+  let seedRoutes = await enumeratePages(homeHTML, targetURL);
   if (seedRoutes.length > 1) {
     console.log(`  🗺️  enumerated ${seedRoutes.length} pages`);
+  }
+  if (validate && seedRoutes.length > 1) {
+    seedRoutes = await validateRoutes(targetURL, seedRoutes);
+    console.log(`  ✓ validated → ${seedRoutes.length} live pages`);
   }
 
   // Step 2: crawl + asset collection
