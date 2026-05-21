@@ -523,8 +523,11 @@ async function runVerifyPhase(outDir, browser, flags) {
     issues.push(...(await probeHover(origPage, clonePage, hoverCandidates)));
     issues.push(...(await auditForms(clonePage)));
     issues.push(...(await probeAnimationTrajectory(origPage, clonePage)));
+    issues.push(...(await probeAnimationFrames(origPage, clonePage)));
+    issues.push(...(await probeScrollCheckpoint(origPage, clonePage)));
+    const deduped = dedupAnimationIssues(issues);
     return {
-      issues,
+      issues: deduped,
       origPage,
       clonePage,
       cleanup: async () => {
@@ -1015,6 +1018,178 @@ function trajectoryDistance(a, b) {
       transformDrift = Math.max(transformDrift, 0.5);
   }
   return { posDrift, opacityDrift, transformDrift };
+}
+
+// v54 C4: probeAnimationFrames — capture 25 full-page screenshots over 5s on
+// BOTH pages in parallel, then pixelDiff each frame pair (orig[i] vs clone[i]).
+// If >5% of frames have ratio > 0.02, emit a page-level visual-drift-animated
+// issue. Frames are captured at ~200ms intervals.
+async function probeAnimationFrames(origPage, clonePage) {
+  const issues = [];
+  const FRAME_COUNT = 25;
+  const FRAME_INTERVAL_MS = 200;
+  const captureFrames = async (page) => {
+    const frames = [];
+    const start = Date.now();
+    for (let i = 0; i < FRAME_COUNT; i++) {
+      const target = start + i * FRAME_INTERVAL_MS;
+      const wait = target - Date.now();
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      try {
+        const buf = await page.screenshot({ fullPage: false });
+        frames.push(buf);
+      } catch (e) {
+        logCaptureError("probeAnimationFrames:screenshot", e);
+        frames.push(null);
+      }
+    }
+    return frames;
+  };
+  let origFrames = [];
+  let cloneFrames = [];
+  try {
+    [origFrames, cloneFrames] = await Promise.all([
+      captureFrames(origPage),
+      captureFrames(clonePage),
+    ]);
+  } catch (e) {
+    logCaptureError("probeAnimationFrames:capture", e);
+    return issues;
+  }
+  let diffyFrames = 0;
+  let maxRatio = 0;
+  for (let i = 0; i < FRAME_COUNT; i++) {
+    const a = origFrames[i];
+    const b = cloneFrames[i];
+    if (!a || !b) continue;
+    try {
+      const aURL = `data:image/png;base64,${a.toString("base64")}`;
+      const bURL = `data:image/png;base64,${b.toString("base64")}`;
+      const ratio = await origPage.evaluate(
+        async ({ a, b }) => {
+          const r = await pixelDiff(a, b, { downsampleW: 512, threshold: 24 });
+          return r.ratio;
+        },
+        { a: aURL, b: bURL },
+      );
+      if (ratio > maxRatio) maxRatio = ratio;
+      if (ratio > 0.02) diffyFrames++;
+    } catch (e) {
+      logCaptureError(`probeAnimationFrames:diff:${i}`, e);
+    }
+  }
+  const diffyFraction = diffyFrames / FRAME_COUNT;
+  if (diffyFraction > 0.05) {
+    issues.push({
+      id: issueId("visual-drift-animated", null, { w: 1440, h: 900 }),
+      type: "visual-drift-animated",
+      selector: null,
+      viewport: { w: 1440, h: 900 },
+      evidence: {
+        diffyFrames,
+        totalFrames: FRAME_COUNT,
+        diffyFraction: Number(diffyFraction.toFixed(3)),
+        maxRatio: Number(maxRatio.toFixed(3)),
+      },
+      fixStrategy: "visual-drift-animated",
+      fixAttempts: 0,
+      resolvedInPass: null,
+    });
+  }
+  return issues;
+}
+
+// v54 C4: probeScrollCheckpoint — for each scroll percentage, scroll both
+// pages to that point, wait 800ms for scroll-driven animations to settle, then
+// screenshot + pixelDiff. ratio > 0.03 emits a scroll-anim-drift issue.
+async function probeScrollCheckpoint(origPage, clonePage) {
+  const issues = [];
+  const CHECKPOINTS = [0, 25, 50, 75, 100];
+  const scrollTo = async (page, pct) => {
+    try {
+      await page.evaluate((p) => {
+        const max = Math.max(
+          0,
+          document.documentElement.scrollHeight - window.innerHeight,
+        );
+        window.scrollTo(0, Math.round((max * p) / 100));
+      }, pct);
+    } catch (e) {
+      logCaptureError(`probeScrollCheckpoint:scrollTo:${pct}`, e);
+    }
+  };
+  for (const pct of CHECKPOINTS) {
+    try {
+      await Promise.all([scrollTo(origPage, pct), scrollTo(clonePage, pct)]);
+      await new Promise((r) => setTimeout(r, 800));
+      const [origShot, cloneShot] = await Promise.all([
+        origPage.screenshot({ fullPage: false }).catch((e) => {
+          logCaptureError(`probeScrollCheckpoint:orig-shot:${pct}`, e);
+          return null;
+        }),
+        clonePage.screenshot({ fullPage: false }).catch((e) => {
+          logCaptureError(`probeScrollCheckpoint:clone-shot:${pct}`, e);
+          return null;
+        }),
+      ]);
+      if (!origShot || !cloneShot) continue;
+      const aURL = `data:image/png;base64,${origShot.toString("base64")}`;
+      const bURL = `data:image/png;base64,${cloneShot.toString("base64")}`;
+      const ratio = await origPage.evaluate(
+        async ({ a, b }) => {
+          const r = await pixelDiff(a, b, { downsampleW: 512, threshold: 24 });
+          return r.ratio;
+        },
+        { a: aURL, b: bURL },
+      );
+      if (ratio > 0.03) {
+        issues.push({
+          id: issueId(`scroll-anim-drift-${pct}`, null, { w: 1440, h: 900 }),
+          type: "scroll-anim-drift",
+          selector: null,
+          viewport: { w: 1440, h: 900 },
+          scrollPct: pct,
+          evidence: {
+            scrollPct: pct,
+            ratio: Number(ratio.toFixed(3)),
+          },
+          fixStrategy: "scroll-anim-drift",
+          fixAttempts: 0,
+          resolvedInPass: null,
+        });
+      }
+    } catch (e) {
+      logCaptureError(`probeScrollCheckpoint:${pct}`, e);
+    }
+  }
+  return issues;
+}
+
+// v54 C4: dedupAnimationIssues — collapse animation-family issues per
+// selector (or page-level key) by priority:
+//   missing-animation (3) > visual-drift-animated (2) > scroll-anim-drift (1).
+// Non-animation issues pass through untouched.
+function dedupAnimationIssues(issues) {
+  const ANIM_PRIORITY = {
+    "missing-animation": 3,
+    "visual-drift-animated": 2,
+    "scroll-anim-drift": 1,
+  };
+  const winners = new Map(); // key -> issue
+  const passthrough = [];
+  for (const issue of issues) {
+    const prio = ANIM_PRIORITY[issue.type];
+    if (!prio) {
+      passthrough.push(issue);
+      continue;
+    }
+    const key = issue.selector || "__page__";
+    const existing = winners.get(key);
+    if (!existing || ANIM_PRIORITY[existing.type] < prio) {
+      winners.set(key, issue);
+    }
+  }
+  return [...passthrough, ...winners.values()];
 }
 
 function pathToFile(p) {
