@@ -80,6 +80,8 @@ for (let i = 0; i < args.length; i++) {
     flags.deploy = true;
   } else if (args[i] === "--ship-name") {
     flags.shipName = args[++i];
+  } else if (args[i] === "--score") {
+    flags.score = true;
   } else {
     positional.push(args[i]);
   }
@@ -118,6 +120,7 @@ Flags:
   --deploy            Deploy to Vercel (--scope=allonelabs --prod)
   --ship              Both --push-git and --deploy
   --ship-name <slug>  Override the auto-derived repo/project name
+  --score             Run score-clone.js after clone+verify; report 0-100 accuracy
 
 Examples:
   node v54-stable.js https://example.com
@@ -6275,6 +6278,26 @@ async function main() {
     } finally {
       await browser.close();
     }
+    if (flags.score) {
+      // --verify-only mode has no positional URL; recover it from manifest.
+      let liveURL = TARGET;
+      if (!liveURL) {
+        try {
+          const m = JSON.parse(
+            fs.readFileSync(
+              path.join(targetDir, "data", "manifest.json"),
+              "utf-8",
+            ),
+          );
+          liveURL = m.url || m.target;
+        } catch {}
+      }
+      if (liveURL) await runScorePhase(targetDir, liveURL);
+      else
+        console.log(
+          "\n📊 Score phase skipped: no live URL (manifest.json missing url)",
+        );
+    }
     if (flags.pushGit || flags.deploy) {
       await runShipPhase(targetDir, flags, PARSED.hostname);
     }
@@ -7935,8 +7958,38 @@ ${stubFooter || ""}
 
   await browser.close();
 
+  if (flags.score) {
+    await runScorePhase(OUT, TARGET || PARSED.toString());
+  }
   if (flags.pushGit || flags.deploy) {
     await runShipPhase(OUT, flags, PARSED.hostname);
+  }
+}
+
+async function runScorePhase(outDir, liveURL) {
+  const { execFileSync } = require("child_process");
+  const scoreScript = path.join(__dirname, "score-clone.js");
+  if (!fs.existsSync(scoreScript)) {
+    console.log("\n📊 Score phase skipped: score-clone.js not found");
+    return;
+  }
+  console.log("\n📊 Scoring clone vs live\n");
+  try {
+    execFileSync(
+      "node",
+      [
+        scoreScript,
+        liveURL,
+        outDir,
+        "--out",
+        path.join(outDir, "data", "score.json"),
+      ],
+      { stdio: "inherit" },
+    );
+  } catch (e) {
+    console.log(
+      `   ⚠ score-clone failed: ${(e.message || "").toString().slice(0, 120)}`,
+    );
   }
 }
 
