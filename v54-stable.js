@@ -1616,6 +1616,14 @@ function writeDebugReport(outDir, loopResult, flags) {
     targetURL = m.url || m.target || "";
   } catch {}
 
+  // Pull score from data/score.json if --score was run.
+  let scoreData = null;
+  try {
+    scoreData = JSON.parse(
+      fs.readFileSync(path.join(outDir, "data", "score.json"), "utf-8"),
+    );
+  } catch {}
+
   // Issue → family color rail. Semantic grouping, not random.
   const familyOf = (t) => {
     if (/^click-|missing-hover|missing-focus|broken-form/.test(t))
@@ -1768,6 +1776,15 @@ body { font-family: var(--sans); margin: 0; padding: 0; font-size: 14px; line-he
 .pass-bar { width: 100%; background: linear-gradient(to top, var(--amber), rgba(245,166,35,.2)); min-height: 2px; transition: opacity .15s; }
 .pass-col:hover .pass-bar { opacity: 0.7; }
 .pass-num { font-family: var(--mono); font-size: 10px; color: var(--text-3); margin-top: 6px; }
+.score-grid { display: flex; flex-direction: column; gap: 8px; }
+.score-row { display: grid; grid-template-columns: 70px 1fr 28px; align-items: center; gap: 10px; font-family: var(--mono); font-size: 11px; }
+.score-label { color: var(--text-3); letter-spacing: 0.04em; }
+.score-bar { height: 6px; background: var(--line-soft); position: relative; overflow: hidden; }
+.score-fill { height: 100%; background: var(--sage); }
+.score-row.score-overall { margin-top: 8px; padding-top: 10px; border-top: 1px solid var(--line-soft); }
+.score-row.score-overall .score-label { color: var(--text); font-family: var(--serif); font-size: 14px; letter-spacing: 0; }
+.score-row.score-overall .score-fill { background: var(--amber); }
+.score-num { text-align: right; color: var(--text-2); }
 
 .main { padding: 56px 64px 96px; max-width: 1100px; }
 .eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; color: var(--text-3); text-transform: uppercase; margin-bottom: 12px; }
@@ -1825,6 +1842,24 @@ body { font-family: var(--sans); margin: 0; padding: 0; font-size: 14px; line-he
       <div class="pass-strip-label">issue count per pass</div>
       <div class="pass-row">${passStrip}</div>
     </div>
+    ${
+      scoreData
+        ? `
+    <div class="pass-strip">
+      <div class="pass-strip-label">accuracy score</div>
+      <div class="score-grid">
+        ${["visual", "structural", "errors", "assets", "interactive"]
+          .map((k) => {
+            const s = scoreData.scores[k] || 0;
+            const w = Math.max(2, Math.round(s));
+            return `<div class="score-row"><div class="score-label">${k}</div><div class="score-bar"><div class="score-fill" style="width:${w}%"></div></div><div class="score-num">${s}</div></div>`;
+          })
+          .join("")}
+        <div class="score-row score-overall"><div class="score-label">overall</div><div class="score-bar"><div class="score-fill" style="width:${Math.max(2, scoreData.scores.overall)}%"></div></div><div class="score-num">${scoreData.scores.overall}</div></div>
+      </div>
+    </div>`
+        : ""
+    }
   </aside>
   <main class="main">
     <div class="eyebrow">unresolved · ${issues.length} issue${issues.length === 1 ? "" : "s"}</div>
