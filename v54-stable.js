@@ -17,6 +17,7 @@ const fs = require("fs");
 const path = require("path");
 const https = require("https");
 const http = require("http");
+const net = require("net");
 const { URL } = require("url");
 const crypto = require("crypto");
 
@@ -71,7 +72,10 @@ for (let i = 0; i < args.length; i++) {
 }
 
 const TARGET = positional[0];
-if (!TARGET) {
+// v54: --verify-only operates on an already-cloned directory, so it does not
+// require a positional URL. Skip the usage guard + URL parse in that mode;
+// `runVerifyPhase` reads the origin URL from manifest.json instead.
+if (!TARGET && !flags.verifyOnly) {
   console.log(`Site X-Ray v54
 Usage: node v54-stable.js <url> [output-dir] [max-pages] [flags]
 
@@ -104,8 +108,11 @@ Examples:
   process.exit(0);
 }
 
-const PARSED = new URL(TARGET);
-if (!["http:", "https:"].includes(PARSED.protocol)) {
+// v54: In --verify-only mode without a TARGET, synthesize a placeholder URL
+// so PARSED/DOMAIN/OUT stay defined. The real origin URL is read from
+// the cloned dir's manifest.json inside runVerifyPhase.
+const PARSED = new URL(TARGET || "http://localhost/");
+if (TARGET && !["http:", "https:"].includes(PARSED.protocol)) {
   console.error("Error: Only http:// and https:// URLs are supported.");
   process.exit(1);
 }
@@ -313,39 +320,81 @@ function resolveStableSelector(el) {
 
 // v54: Local-server lifecycle for serving the clone during verify
 const { spawn } = require("child_process");
+
+// v54: TCP connect probe — resolves true if a listener is accepting on port.
+function probePort(port, host = "127.0.0.1") {
+  return new Promise((resolve) => {
+    const sock = net.connect({ port, host });
+    sock.once("connect", () => {
+      sock.end();
+      resolve(true);
+    });
+    sock.once("error", () => resolve(false));
+  });
+}
+
 function startLocalServer(dir, port = 19876) {
+  // NOTE: `detached: true` and `process.kill(-srv.pid)` below are paired —
+  // detached makes the child a process-group leader so we can signal the
+  // whole group via the negative pid. Drop one without the other and
+  // orphaned python servers / un-killable processes will follow.
+  // stdio: "ignore" — nobody reads python's stdout/stderr, and "pipe"
+  // would let a chatty long-running server fill the OS pipe buffer.
   const srv = spawn(
     "python3",
     ["-m", "http.server", String(port), "--directory", dir],
-    { stdio: "pipe", detached: true },
+    { stdio: "ignore", detached: true },
   );
   return new Promise((resolve, reject) => {
-    let resolved = false;
-    const timer = setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        reject(new Error("local server start timeout"));
+    let settled = false;
+    const kill = () => {
+      try {
+        process.kill(-srv.pid);
+      } catch {
+        try {
+          srv.kill();
+        } catch {}
       }
-    }, 5000);
-    // Wait for port — simplest signal: 1.5s delay (matches v52's pattern)
-    setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        clearTimeout(timer);
+    };
+    // If python dies before the port opens (port already taken, missing
+    // python, etc.), surface the failure immediately.
+    const onExit = (code, signal) => {
+      if (settled) return;
+      settled = true;
+      reject(
+        new Error(
+          `local server exited before port opened (code=${code}, signal=${signal})`,
+        ),
+      );
+    };
+    srv.once("exit", onExit);
+
+    const startedAt = Date.now();
+    const POLL_MS = 100;
+    const TIMEOUT_MS = 5000;
+    const tick = async () => {
+      if (settled) return;
+      const ok = await probePort(port);
+      if (settled) return;
+      if (ok) {
+        settled = true;
+        srv.removeListener("exit", onExit);
         resolve({
           url: `http://localhost:${port}`,
-          kill: () => {
-            try {
-              process.kill(-srv.pid);
-            } catch {
-              try {
-                srv.kill();
-              } catch {}
-            }
-          },
+          kill,
         });
+        return;
       }
-    }, 1500);
+      if (Date.now() - startedAt >= TIMEOUT_MS) {
+        settled = true;
+        srv.removeListener("exit", onExit);
+        kill();
+        reject(new Error("local server start timeout"));
+        return;
+      }
+      setTimeout(tick, POLL_MS);
+    };
+    setTimeout(tick, POLL_MS);
   });
 }
 
