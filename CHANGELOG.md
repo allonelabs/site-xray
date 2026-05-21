@@ -2,6 +2,26 @@
 
 Notable changes to Site X-Ray. See `git log v54-stable.js` for full per-commit history.
 
+## xray-static (new engine)
+
+Adds `xray-static.js` — a Playwright-free HTTP-only clone engine for sites that ship full content in their HTML response (SSR Next.js, Astro, Hugo, WordPress, plain HTML).
+
+- Detects "static-enough" by checking visible text length and SPA-shell signatures. `--force` overrides.
+- Parallel asset download (12 concurrent) with per-asset 50MB cap, 15s request timeout, and recursive CSS `url()` expansion.
+- URL rewriting maps each absolute URL into its path-only, origin+path, and HTML-entity-encoded variants — fixes the otherwise-common "downloaded but not linked" bug where HTML uses relative paths.
+- Writes a `manifest.json` compatible with `score-clone.js`, so scoring works the same as Playwright clones.
+
+**Benchmarks** (tailwindcss.com, 10 pages):
+
+| Engine             | Time    | Score      |
+| ------------------ | ------- | ---------- |
+| v54-stable.js      | 11:46   | 75/100     |
+| **xray-static.js** | **40s** | **77/100** |
+
+16× faster, +2 points higher. The structural dimension jumps 71 → 99 because raw SSR HTML is cleaner than a Playwright-captured post-hydration DOM that includes runtime markup the live site cleans up.
+
+Not a replacement for `v54-stable.js` — anti-bot CDNs (Stripe-style) block raw HTTP. Use `v54-stable.js` for those.
+
 ## v54
 
 Adds an iterative verify+fix loop, an accuracy-measurement tool, and a one-command ship pipeline (git + Vercel) on top of v52's clone engine.
