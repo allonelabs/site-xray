@@ -166,6 +166,29 @@ async function probeStructural(origPage, clonePage) {
         for (const el of document.querySelectorAll(sel)) if (visible(el)) n++;
         return n;
       };
+      // Count only top-level affordances: an element matching `sel` whose
+      // ancestor chain doesn't include another match. Catches the case where
+      // static HTML has nested role="button" markup (icon + label + wrapper
+      // all carrying role=button) but the live runtime has cleaned them into
+      // one affordance.
+      const countVisibleOuter = (sel) => {
+        let n = 0;
+        const all = Array.from(document.querySelectorAll(sel));
+        for (const el of all) {
+          if (!visible(el)) continue;
+          let anc = el.parentElement;
+          let nested = false;
+          while (anc) {
+            if (anc.matches(sel)) {
+              nested = true;
+              break;
+            }
+            anc = anc.parentElement;
+          }
+          if (!nested) n++;
+        }
+        return n;
+      };
       const all = document.querySelectorAll("*");
       let visibleCount = 0;
       for (const el of all) if (visible(el)) visibleCount++;
@@ -173,8 +196,8 @@ async function probeStructural(origPage, clonePage) {
       return {
         total: all.length,
         visible: visibleCount,
-        links: countVisible("a[href]"),
-        buttons: countVisible(
+        links: countVisibleOuter("a[href]"),
+        buttons: countVisibleOuter(
           'button, [role="button"], input[type="button"], input[type="submit"]',
         ),
         forms: countVisible("form"),
