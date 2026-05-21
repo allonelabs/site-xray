@@ -619,13 +619,24 @@ async function probeNextBuildManifest(origin, html) {
 
 async function enumeratePages(html, baseURL) {
   const origin = new URL(baseURL).origin;
-  const enumerated = new Set();
-  enumerated.add(new URL(baseURL).pathname || "/");
+  // Route → priority score. Higher = more important. When max-pages clips
+  // we keep the top N. Source priorities (rough order of "user-reachable"):
+  //   1000  homepage (always first)
+  //    500  HTML <a> on homepage (visible navigation)
+  //    100  sitemap.xml (curated by the site owner)
+  //     70  inline __NEXT_DATA__ / __NUXT__ / __INITIAL_STATE__
+  //     60  Next.js _buildManifest, WordPress /wp-json
+  //     40  other JSON API endpoints
+  //     30  feeds (RSS / Atom)
+  //     20  robots.txt → sitemap
+  // Within a source, earlier-in-list wins (sitemap usually puts homepage
+  // and top-level pages first).
+  const score = new Map();
+  const seen = (path, weight) => {
+    if (!score.has(path) || score.get(path) < weight) score.set(path, weight);
+  };
+  seen(new URL(baseURL).pathname || "/", 1000);
 
-  // Run every probe in parallel — most return [] for sites that don't match
-  // their pattern; that's expected. The fastest probes (sitemap, inline
-  // JSON) usually answer in < 200ms. JSON API probes time out cleanly
-  // when not present.
   const xmlEndpoints = [
     "/sitemap.xml",
     "/sitemap_index.xml",
@@ -641,57 +652,67 @@ async function enumeratePages(html, baseURL) {
     "/index.xml",
   ];
   const jsonEndpoints = [
-    // WordPress
     "/wp-json/wp/v2/posts?per_page=100&_fields=link",
     "/wp-json/wp/v2/pages?per_page=100&_fields=link",
-    // Generic
     "/api/pages",
     "/api/posts",
     "/api/content",
     "/api/routes",
     "/api/v1/pages",
     "/api/v1/posts",
-    // Shopify
     "/products.json?limit=250",
     "/collections.json?limit=250",
-    // Sanity, Strapi, Ghost (common patterns)
     "/api/content/posts",
     "/api/content/pages",
     "/ghost/api/v3/content/posts",
   ];
 
+  // Each probe is wrapped to return a [routes, weight] pair so we can
+  // attribute priority to the source.
   const probes = [
-    ...xmlEndpoints.map((p) => probeXMLEndpoint(origin + p, origin)),
-    ...jsonEndpoints.map((p) => probeJSONEndpoint(origin + p, origin)),
-    probeRobotsTxt(origin),
-    probeNextBuildManifest(origin, html),
-    Promise.resolve(extractInlineJSONRoutes(html, origin)),
+    ...xmlEndpoints.map((p) =>
+      probeXMLEndpoint(origin + p, origin).then((r) => [
+        r,
+        /sitemap/i.test(p) ? 100 : 30,
+      ]),
+    ),
+    ...jsonEndpoints.map((p) =>
+      probeJSONEndpoint(origin + p, origin).then((r) => [
+        r,
+        /wp-json/i.test(p) ? 60 : 40,
+      ]),
+    ),
+    probeRobotsTxt(origin).then((r) => [r, 20]),
+    probeNextBuildManifest(origin, html).then((r) => [r, 60]),
+    Promise.resolve([extractInlineJSONRoutes(html, origin), 70]),
   ];
   const results = await Promise.allSettled(probes);
   for (const r of results) {
-    if (r.status === "fulfilled" && Array.isArray(r.value))
-      for (const route of r.value) enumerated.add(route);
+    if (r.status !== "fulfilled" || !Array.isArray(r.value)) continue;
+    const [routes, weight] = r.value;
+    if (!Array.isArray(routes)) continue;
+    for (const route of routes) seen(route, weight);
   }
 
-  // Always also harvest <a href> from the homepage as a baseline so we
-  // don't miss anything when no API works.
+  // Homepage <a href> — high priority because these are the links a real
+  // visitor would see and click first.
   for (const m of html.matchAll(/<a\b[^>]*?\bhref="([^"]+)"/gi)) {
     try {
       const abs = new URL(m[1], baseURL);
-      if (abs.origin === origin) enumerated.add(abs.pathname);
+      if (abs.origin === origin) seen(abs.pathname, 500);
     } catch {}
   }
 
   // Filter (1) non-HTML extensions and (2) backend / admin / API paths.
-  // The JSON walker can pick these up as if they were page routes —
-  // they aren't. Example: WP returns `_links: { wp:post_type: [...] }`
-  // where each entry has an `href: "https://site/wp-json/wp/v2/posts/N"`.
-  // We don't want to clone the JSON endpoint as if it were a page.
   const SKIP_EXT =
     /\.(xml|json|rss|atom|txt|pdf|zip|tar|gz|jpg|jpeg|png|gif|webp|svg|ico|woff2?|ttf|otf|mp4|webm|mov|wav|mp3|map)(\?|$)/i;
   const SKIP_PATH =
     /^\/(?:api|rest|_api|_next\/data|_nuxt\/data|graphql|wp-admin|wp-json|wp-login|admin|dashboard|login|logout|signin|signout|signup|register|account)(?:\/|$|\?)/i;
-  return [...enumerated].filter((p) => !SKIP_EXT.test(p) && !SKIP_PATH.test(p));
+  // Sort by priority desc — when max-pages clips, top entries are kept.
+  return [...score.entries()]
+    .filter(([p]) => !SKIP_EXT.test(p) && !SKIP_PATH.test(p))
+    .sort((a, b) => b[1] - a[1])
+    .map(([p]) => p);
 }
 
 async function main() {
