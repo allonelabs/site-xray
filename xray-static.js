@@ -324,110 +324,137 @@ function rewriteHTML(html, urlMap) {
   return out;
 }
 
-// ─── Framework detection + page enumeration ───────────────────────────
+// ─── Universal page enumeration (X-ray) ────────────────────────────────
 //
-// The real X-ray. Instead of crawling HTML links one-by-one, sniff the
-// site's framework signature on the homepage and ask the framework
-// itself "what pages do you have?". Most frameworks expose this either
-// via a build manifest (Next.js) or a JSON API (WordPress, Shopify,
-// Astro content collections). Skips dozens of HTTP fetches and finds
-// pages that aren't linked from the homepage.
+// Don't hand-code one adapter per framework. Try a list of common patterns
+// in parallel and use whichever ones answer. Each probe is independent;
+// success/failure on one doesn't affect the others. This catches:
+//   - sitemap.xml / sitemap_index.xml / robots.txt Sitemap directives
+//   - RSS / Atom feeds (blogs, content sites)
+//   - WordPress / Strapi / Sanity-style JSON APIs
+//   - Shopify products/collections JSON
+//   - Next.js __NEXT_DATA__ + _buildManifest.js
+//   - Any inline <script type="application/json"> or window.__INITIAL_STATE__
+//   - HTML link references on the homepage
+//
+// detectFramework remains for INFORMATIONAL output ("this looks like Next.js"),
+// not for enumeration logic. Whatever the framework, the universal probes
+// will pick up its routes.
 
-function detectFramework(html, baseURL) {
+function detectFramework(html) {
   if (!html) return null;
-  // Next.js
-  if (
-    /<script id="__NEXT_DATA__"/.test(html) ||
-    /\/_next\/static\//.test(html)
-  ) {
-    return { kind: "next", evidence: "__NEXT_DATA__ or /_next/" };
-  }
-  // Nuxt (Vue's Next-equivalent)
-  if (/window\.__NUXT__/.test(html) || /<div id="__nuxt">/.test(html)) {
-    return { kind: "nuxt", evidence: "__NUXT__ marker" };
-  }
-  // Astro (SSG)
-  if (
-    /<meta\s+name=["']generator["']\s+content=["']Astro/i.test(html) ||
-    /<astro-island/.test(html) ||
-    /data-astro-cid-/.test(html)
-  ) {
-    return { kind: "astro", evidence: "Astro generator meta or astro-island" };
-  }
-  // WordPress
-  if (
-    /<meta\s+name=["']generator["']\s+content=["']WordPress/i.test(html) ||
-    /\/wp-content\//.test(html) ||
-    /\/wp-json\//.test(html)
-  ) {
-    return {
+  const checks = [
+    { kind: "next", re: /<script id="__NEXT_DATA__"|\/_next\/static\// },
+    { kind: "nuxt", re: /window\.__NUXT__|<div id="__nuxt">/ },
+    {
+      kind: "astro",
+      re: /<meta\s+name=["']generator["']\s+content=["']Astro|<astro-island|data-astro-cid-/i,
+    },
+    {
       kind: "wordpress",
-      evidence: "WordPress generator meta or wp-content path",
-    };
-  }
-  // Hugo
-  if (/<meta\s+name=["']generator["']\s+content=["']Hugo/i.test(html)) {
-    return { kind: "hugo", evidence: "Hugo generator meta" };
-  }
-  // Jekyll / 11ty fall under "static html" — no framework introspection needed
-  // Gatsby
-  if (/<div id="___gatsby">/.test(html) || /\/page-data\//.test(html)) {
-    return { kind: "gatsby", evidence: "___gatsby or /page-data/" };
-  }
-  // Shopify
-  if (/cdn\.shopify\.com/.test(html) || /window\.Shopify/.test(html)) {
-    return { kind: "shopify", evidence: "shopify cdn / global" };
+      re: /<meta\s+name=["']generator["']\s+content=["']WordPress|\/wp-content\/|\/wp-json\//i,
+    },
+    { kind: "hugo", re: /<meta\s+name=["']generator["']\s+content=["']Hugo/i },
+    { kind: "gatsby", re: /<div id="___gatsby">|\/page-data\// },
+    { kind: "shopify", re: /cdn\.shopify\.com|window\.Shopify/ },
+    {
+      kind: "webflow",
+      re: /<html[^>]*\bdata-wf-(?:page|site)="|<script[^>]+webflow\.js/i,
+    },
+    {
+      kind: "squarespace",
+      re: /static1\.squarespace\.com|Static\.SQUARESPACE_CONTEXT/,
+    },
+  ];
+  for (const c of checks) {
+    if (c.re.test(html)) return { kind: c.kind, evidence: c.re.toString() };
   }
   return null;
 }
 
-// Pull buildId + initial route list from a Next.js page.
-function nextJSRoutes(html, baseURL) {
-  const routes = new Set();
-  // __NEXT_DATA__ payload — JSON-encoded, has buildId
-  let buildId = null;
-  const m = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-  if (m) {
-    try {
-      const data = JSON.parse(m[1]);
-      buildId = data.buildId;
-      if (data.page && typeof data.page === "string") routes.add(data.page);
-    } catch {}
+// Recursively walk a parsed JSON object collecting any string values that
+// look like routes on this origin. Generalizes WordPress' .link field,
+// Shopify's .handle, Sanity's .slug, Next.js' page strings, etc. — any
+// framework that exposes content as JSON ships its URLs somewhere in there.
+function extractRoutesFromJSON(node, origin, routes, depth = 0) {
+  if (depth > 12 || !node) return;
+  if (typeof node === "string") {
+    // Pathname starting with / (and not //, not /_next/static asset)
+    if (
+      /^\/(?!\/|_next\/static\/|_nuxt\/|_astro\/|assets\/|wp-content\/|api\/)[^"<>{}|\\^`\s]+$/.test(
+        node,
+      ) &&
+      !/\.(js|css|woff2?|ttf|otf|png|jpe?g|gif|webp|svg|ico|mp4|webm|json|xml|map)(\?|$)/i.test(
+        node,
+      )
+    ) {
+      routes.add(node.split("#")[0]); // strip fragment
+    } else if (/^https?:/.test(node)) {
+      try {
+        const u = new URL(node);
+        if (u.origin === origin) routes.add(u.pathname);
+      } catch {}
+    }
+    return;
   }
-  // Extract direct href references as a baseline
-  const origin = new URL(baseURL).origin;
-  for (const linkMatch of html.matchAll(/<a\b[^>]*?\bhref="([^"]+)"/gi)) {
-    try {
-      const abs = new URL(linkMatch[1], baseURL).toString();
-      if (abs.startsWith(origin)) routes.add(new URL(abs).pathname);
-    } catch {}
+  if (Array.isArray(node)) {
+    for (const item of node)
+      extractRoutesFromJSON(item, origin, routes, depth + 1);
+    return;
   }
-  return { routes: [...routes], buildId };
+  if (typeof node === "object") {
+    for (const v of Object.values(node))
+      extractRoutesFromJSON(v, origin, routes, depth + 1);
+  }
 }
 
-// Fetch the Next.js _buildManifest.js if we have a buildId — it lists every
-// page route the bundler knows about (including not-linked-from-homepage).
-async function nextJSFetchBuildManifest(baseURL, buildId) {
-  if (!buildId) return [];
+async function probeJSONEndpoint(url, origin) {
   try {
-    const u = new URL(`/_next/static/${buildId}/_buildManifest.js`, baseURL);
-    const res = await fetchURL(u.toString());
+    const res = await fetchURL(url);
     if (res.status >= 400) return [];
-    const body = res.body.toString("utf-8");
-    // The manifest is JS like:
-    //   self.__BUILD_MANIFEST = function(a,b,c,...){return {"/": [...], "/about": [...]}}(...)
-    // The KEYS of that object are the routes. Regex-extract.
+    const ct = (res.headers["content-type"] || "").toLowerCase();
+    if (!ct.includes("json") && !res.body.toString("utf-8", 0, 1).match(/[{[]/))
+      return [];
+    let data;
+    try {
+      data = JSON.parse(res.body.toString("utf-8"));
+    } catch {
+      return [];
+    }
     const routes = new Set();
-    for (const m of body.matchAll(/"(\/[^"]*)":/g)) {
-      const r = m[1];
-      if (
-        r &&
-        !r.startsWith("/_next/") &&
-        !r.startsWith("//") &&
-        !r.includes("[") // skip dynamic-route placeholders like /blog/[slug]
-      ) {
-        routes.add(r);
-      }
+    extractRoutesFromJSON(data, origin, routes);
+    return [...routes];
+  } catch {
+    return [];
+  }
+}
+
+async function probeXMLEndpoint(url, origin) {
+  try {
+    const res = await fetchURL(url);
+    if (res.status >= 400) return [];
+    const xml = res.body.toString("utf-8");
+    const routes = new Set();
+    // sitemap.xml <loc>...</loc>
+    for (const m of xml.matchAll(/<loc>([^<]+)<\/loc>/gi)) {
+      try {
+        const u = new URL(m[1]);
+        if (u.origin === origin) routes.add(u.pathname);
+      } catch {}
+    }
+    // sitemap index: <sitemap><loc>...</loc></sitemap> — already captured.
+    // Atom/RSS: <link href="..."/> or <link>...</link>
+    for (const m of xml.matchAll(/<link[^>]*\bhref="([^"]+)"/gi)) {
+      try {
+        const u = new URL(m[1], origin);
+        if (u.origin === origin) routes.add(u.pathname);
+      } catch {}
+    }
+    for (const m of xml.matchAll(/<link>([^<]+)<\/link>/gi)) {
+      try {
+        const u = new URL(m[1], origin);
+        if (u.origin === origin) routes.add(u.pathname);
+      } catch {}
     }
     return [...routes];
   } catch {
@@ -435,92 +462,162 @@ async function nextJSFetchBuildManifest(baseURL, buildId) {
   }
 }
 
-// WordPress REST API — list all posts + pages.
-async function wordpressRoutes(baseURL) {
-  const origin = new URL(baseURL).origin;
-  const routes = new Set();
-  const fetchType = async (type) => {
-    let page = 1;
-    while (page <= 5) {
-      // cap at 5 × 100 = 500 entries per type
-      try {
-        const url = `${origin}/wp-json/wp/v2/${type}?per_page=100&page=${page}&_fields=link`;
-        const res = await fetchURL(url);
-        if (res.status >= 400) break;
-        let data;
-        try {
-          data = JSON.parse(res.body.toString("utf-8"));
-        } catch {
-          break;
-        }
-        if (!Array.isArray(data) || data.length === 0) break;
-        for (const item of data) {
-          if (item.link) {
-            try {
-              const abs = new URL(item.link);
-              if (abs.origin === origin) routes.add(abs.pathname);
-            } catch {}
-          }
-        }
-        if (data.length < 100) break;
-        page++;
-      } catch {
-        break;
-      }
-    }
-  };
-  await fetchType("posts");
-  await fetchType("pages");
-  return [...routes];
+// robots.txt may list one or more Sitemap: URLs. Fetch each and union.
+async function probeRobotsTxt(origin) {
+  try {
+    const res = await fetchURL(origin + "/robots.txt");
+    if (res.status >= 400) return [];
+    const body = res.body.toString("utf-8");
+    const sitemapURLs = [...body.matchAll(/sitemap:\s*(\S+)/gi)]
+      .map((m) => m[1])
+      .filter((u) => u.startsWith("http"));
+    const results = await Promise.all(
+      sitemapURLs.map((u) => probeXMLEndpoint(u, origin)),
+    );
+    return [...new Set(results.flat())];
+  } catch {
+    return [];
+  }
 }
 
-// Generic sitemap.xml fetcher
-async function sitemapRoutes(baseURL) {
-  const origin = new URL(baseURL).origin;
+// Inline JSON blobs in the HTML. Covers __NEXT_DATA__, __NUXT__,
+// __INITIAL_STATE__, and any <script type="application/json"> block.
+function extractInlineJSONRoutes(html, origin) {
   const routes = new Set();
-  for (const candidate of ["/sitemap.xml", "/sitemap_index.xml"]) {
+  // <script id="__NEXT_DATA__" type="application/json">...</script>
+  // <script type="application/json" ...>...</script>
+  // <script type="application/ld+json">...</script>
+  const scripts = [
+    ...html.matchAll(
+      /<script\b[^>]*\btype="application\/(?:ld\+)?json"[^>]*>([\s\S]*?)<\/script>/gi,
+    ),
+    ...html.matchAll(
+      /<script\b[^>]*\bid="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/gi,
+    ),
+  ];
+  for (const m of scripts) {
     try {
-      const res = await fetchURL(origin + candidate);
-      if (res.status >= 400) continue;
-      const xml = res.body.toString("utf-8");
-      for (const m of xml.matchAll(/<loc>([^<]+)<\/loc>/gi)) {
-        try {
-          const abs = new URL(m[1]);
-          if (abs.origin === origin) routes.add(abs.pathname);
-        } catch {}
-      }
+      extractRoutesFromJSON(JSON.parse(m[1]), origin, routes);
+    } catch {}
+  }
+  // window.__NUXT__ = { ... };
+  // window.__INITIAL_STATE__ = { ... };
+  for (const m of html.matchAll(
+    /window\.__(?:NUXT|INITIAL_STATE|APOLLO_STATE|PRELOADED_STATE|REDUX_STATE)__\s*=\s*([\s\S]*?);\s*<\/script>/g,
+  )) {
+    try {
+      // The expression might be an inline-evaluated JS object — strip to JSON-ish
+      const cleaned = m[1].replace(/^\(?(.*?)\)?$/s, "$1");
+      extractRoutesFromJSON(JSON.parse(cleaned), origin, routes);
     } catch {}
   }
   return [...routes];
 }
 
-async function enumeratePages(html, baseURL, framework) {
+// Next.js _buildManifest is JS, not JSON — regex-extract the route keys.
+async function probeNextBuildManifest(origin, html) {
+  const m = html.match(
+    /<script\b[^>]*\bid="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/,
+  );
+  if (!m) return [];
+  let buildId;
+  try {
+    buildId = JSON.parse(m[1]).buildId;
+  } catch {
+    return [];
+  }
+  if (!buildId) return [];
+  try {
+    const res = await fetchURL(
+      `${origin}/_next/static/${buildId}/_buildManifest.js`,
+    );
+    if (res.status >= 400) return [];
+    const body = res.body.toString("utf-8");
+    const routes = new Set();
+    for (const m of body.matchAll(/"(\/[^"]*)":/g)) {
+      const r = m[1];
+      if (
+        r &&
+        !r.startsWith("/_next/") &&
+        !r.startsWith("//") &&
+        !r.includes("[")
+      )
+        routes.add(r);
+    }
+    return [...routes];
+  } catch {
+    return [];
+  }
+}
+
+async function enumeratePages(html, baseURL) {
+  const origin = new URL(baseURL).origin;
   const enumerated = new Set();
-  // Always include the homepage path
   enumerated.add(new URL(baseURL).pathname || "/");
 
-  // 1) Sitemap.xml — applies to most frameworks
-  for (const r of await sitemapRoutes(baseURL)) enumerated.add(r);
+  // Run every probe in parallel — most return [] for sites that don't match
+  // their pattern; that's expected. The fastest probes (sitemap, inline
+  // JSON) usually answer in < 200ms. JSON API probes time out cleanly
+  // when not present.
+  const xmlEndpoints = [
+    "/sitemap.xml",
+    "/sitemap_index.xml",
+    "/sitemap-1.xml",
+    "/sitemap-pages.xml",
+    "/sitemap-posts.xml",
+    "/sitemap-index.xml",
+    "/feed",
+    "/feed.xml",
+    "/rss",
+    "/rss.xml",
+    "/atom.xml",
+    "/index.xml",
+  ];
+  const jsonEndpoints = [
+    // WordPress
+    "/wp-json/wp/v2/posts?per_page=100&_fields=link",
+    "/wp-json/wp/v2/pages?per_page=100&_fields=link",
+    // Generic
+    "/api/pages",
+    "/api/posts",
+    "/api/content",
+    "/api/routes",
+    "/api/v1/pages",
+    "/api/v1/posts",
+    // Shopify
+    "/products.json?limit=250",
+    "/collections.json?limit=250",
+    // Sanity, Strapi, Ghost (common patterns)
+    "/api/content/posts",
+    "/api/content/pages",
+    "/ghost/api/v3/content/posts",
+  ];
 
-  // 2) Framework-specific page enumeration
-  if (framework) {
-    if (framework.kind === "next") {
-      const { routes, buildId } = nextJSRoutes(html, baseURL);
-      for (const r of routes) enumerated.add(r);
-      for (const r of await nextJSFetchBuildManifest(baseURL, buildId))
-        enumerated.add(r);
-    } else if (framework.kind === "wordpress") {
-      for (const r of await wordpressRoutes(baseURL)) enumerated.add(r);
-    }
-    // astro/hugo/gatsby: their content is in sitemap.xml — already covered
+  const probes = [
+    ...xmlEndpoints.map((p) => probeXMLEndpoint(origin + p, origin)),
+    ...jsonEndpoints.map((p) => probeJSONEndpoint(origin + p, origin)),
+    probeRobotsTxt(origin),
+    probeNextBuildManifest(origin, html),
+    Promise.resolve(extractInlineJSONRoutes(html, origin)),
+  ];
+  const results = await Promise.allSettled(probes);
+  for (const r of results) {
+    if (r.status === "fulfilled" && Array.isArray(r.value))
+      for (const route of r.value) enumerated.add(route);
   }
 
-  // Filter out enumerated entries that aren't HTML pages. Sitemap.xml lists
-  // include things like /sitemap-1.xml, /image-sitemap-1.xml — we don't
-  // want to crawl those as if they were content. Also skip common non-
-  // page extensions and feeds.
+  // Always also harvest <a href> from the homepage as a baseline so we
+  // don't miss anything when no API works.
+  for (const m of html.matchAll(/<a\b[^>]*?\bhref="([^"]+)"/gi)) {
+    try {
+      const abs = new URL(m[1], baseURL);
+      if (abs.origin === origin) enumerated.add(abs.pathname);
+    } catch {}
+  }
+
+  // Filter non-HTML routes (sitemap files, feeds, asset extensions).
   const SKIP_RE =
-    /\.(xml|json|rss|atom|txt|pdf|zip|tar|gz|jpg|jpeg|png|gif|webp|svg|ico|woff2?|ttf|otf|mp4|webm|mov|wav|mp3)(\?|$)/i;
+    /\.(xml|json|rss|atom|txt|pdf|zip|tar|gz|jpg|jpeg|png|gif|webp|svg|ico|woff2?|ttf|otf|mp4|webm|mov|wav|mp3|map)(\?|$)/i;
   return [...enumerated].filter((p) => !SKIP_RE.test(p));
 }
 
@@ -575,15 +672,11 @@ async function main() {
   // itself "what pages do you have?" via its build manifest / JSON API /
   // sitemap. Catches pages not linked from the homepage and skips dozens
   // of HTTP hops worth of HTML-link discovery.
-  const framework = detectFramework(homeHTML, targetURL);
-  if (framework) {
-    console.log(`  🔍 framework: ${framework.kind} (${framework.evidence})`);
-  }
-  const seedRoutes = await enumeratePages(homeHTML, targetURL, framework);
+  const framework = detectFramework(homeHTML);
+  if (framework) console.log(`  🔍 framework: ${framework.kind}`);
+  const seedRoutes = await enumeratePages(homeHTML, targetURL);
   if (seedRoutes.length > 1) {
-    console.log(
-      `  🗺️  enumerated ${seedRoutes.length} pages from ${framework ? framework.kind + " + " : ""}sitemap`,
-    );
+    console.log(`  🗺️  enumerated ${seedRoutes.length} pages`);
   }
 
   // Step 2: crawl + asset collection
