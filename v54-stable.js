@@ -318,6 +318,61 @@ function resolveStableSelector(el) {
 }
 `;
 
+// v54: In-browser canvas pixel-diff — both PNGs loaded as Image, drawn to OffscreenCanvas, diffed
+const PIXEL_DIFF_SRC = `
+async function pixelDiff(urlA, urlB, opts) {
+  opts = opts || {};
+  const downsampleW = opts.downsampleW || 1280;
+  const threshold = opts.threshold || 32; // luminance delta
+  const load = (url) => new Promise((res, rej) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => res(img);
+    img.onerror = rej;
+    img.src = url;
+  });
+  const [a, b] = await Promise.all([load(urlA), load(urlB)]);
+  const w = Math.min(downsampleW, a.naturalWidth, b.naturalWidth);
+  const ratioA = w / a.naturalWidth;
+  const ratioB = w / b.naturalWidth;
+  const hA = Math.round(a.naturalHeight * ratioA);
+  const hB = Math.round(b.naturalHeight * ratioB);
+  const h = Math.min(hA, hB);
+  const canvA = new OffscreenCanvas(w, h);
+  const canvB = new OffscreenCanvas(w, h);
+  canvA.getContext('2d').drawImage(a, 0, 0, w, h);
+  canvB.getContext('2d').drawImage(b, 0, 0, w, h);
+  const dataA = canvA.getContext('2d').getImageData(0, 0, w, h).data;
+  const dataB = canvB.getContext('2d').getImageData(0, 0, w, h).data;
+  let diffPx = 0;
+  const hotRegions = []; // { x, y } centroids of 32x32 hot tiles
+  const tileSize = 32;
+  const tilesX = Math.ceil(w / tileSize);
+  const tilesY = Math.ceil(h / tileSize);
+  const tileScores = new Array(tilesX * tilesY).fill(0);
+  for (let i = 0; i < dataA.length; i += 4) {
+    const lumA = 0.299 * dataA[i] + 0.587 * dataA[i+1] + 0.114 * dataA[i+2];
+    const lumB = 0.299 * dataB[i] + 0.587 * dataB[i+1] + 0.114 * dataB[i+2];
+    if (Math.abs(lumA - lumB) > threshold) {
+      diffPx++;
+      const px = (i / 4) % w;
+      const py = Math.floor((i / 4) / w);
+      const tx = Math.floor(px / tileSize);
+      const ty = Math.floor(py / tileSize);
+      tileScores[ty * tilesX + tx]++;
+    }
+  }
+  for (let ty = 0; ty < tilesY; ty++) {
+    for (let tx = 0; tx < tilesX; tx++) {
+      if (tileScores[ty * tilesX + tx] > tileSize * tileSize * 0.2) {
+        hotRegions.push({ x: tx * tileSize, y: ty * tileSize, w: tileSize, h: tileSize });
+      }
+    }
+  }
+  return { diffPx, totalPx: w * h, ratio: diffPx / (w * h), hotRegions };
+}
+`;
+
 // v54: Local-server lifecycle for serving the clone during verify
 const { spawn } = require("child_process");
 
