@@ -8134,8 +8134,21 @@ async function shipToGit(outDir, repo) {
   const { execSync } = require("child_process");
   const run = (cmd, opts = {}) =>
     execSync(cmd, { cwd: outDir, encoding: "utf-8", ...opts }).trim();
-  // Idempotent .gitignore — avoid pushing massive playwright/node modules.
-  const gi = ["node_modules/\n", ".vercel/\n", "*.log\n"].join("");
+  // Idempotent .gitignore — avoid pushing the cloner's diagnostic
+  // artifacts (per-page screenshots, intermediate JSON) since they aren't
+  // referenced from any HTML and bloat the deploy. Issue-evidence
+  // screenshots under data/issues/ ARE referenced from debug-report.html
+  // so we keep those. Same for manifest.json, url-map.json, etc.
+  const gi = [
+    "node_modules/\n",
+    ".vercel/\n",
+    "*.log\n",
+    // Per-page screenshots in data/ aren't referenced from any HTML, just
+    // kept for human inspection — strip from deploy. Subdirs aren't matched
+    // by data/*.png, so data/issues/*.png evidence (used in debug-report)
+    // is preserved.
+    "data/*.png\n",
+  ].join("");
   const giPath = path.join(outDir, ".gitignore");
   if (
     !fs.existsSync(giPath) ||
