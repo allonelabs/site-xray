@@ -1331,6 +1331,88 @@ async function applyFix(issue, outDir, origPage, clonePage) {
   }
 }
 
+// v54 E1: runUntilClean — stall-aware multi-pass verify+fix loop.
+// Each iteration re-runs the full verify phase (fresh contexts), persists
+// pass-N.json via writePassIssues, and (unless --no-fix) calls applyFix on
+// each issue. Stops when one of:
+//   - 0 issues remain                       → stopReason "clean"
+//   - 2 consecutive non-decreasing passes   → stopReason "stalled"
+//   - pass >= flags.maxPasses               → stopReason "max-passes"
+//   - flags.noFix is set                    → stopReason "no-fix" (after pass 1)
+// Returns { stopReason, history, finalIssues }. history is an array of
+// { pass, issueCount, applied, attempted } records (with the final entry
+// having applied=0, attempted=0 when stopReason is "clean" or terminal).
+async function runUntilClean(outDir, browser, flags) {
+  const maxPasses = flags.maxPasses ?? Infinity;
+  let prev = Infinity;
+  let stall = 0;
+  let pass = 0;
+  const history = [];
+  let stopReason = null;
+  let finalIssues = [];
+  while (true) {
+    pass++;
+    console.log(`\n🔬 v54 verify pass ${pass}...`);
+    const result = await runVerifyPhase(outDir, browser, flags);
+    const ic = result.issues.length;
+    finalIssues = result.issues;
+    writePassIssues(outDir, pass, result.issues);
+    console.log(`   ${ic} issue(s) found`);
+    if (ic === 0) {
+      stopReason = "clean";
+      history.push({ pass, issueCount: ic, applied: 0, attempted: 0 });
+      await result.cleanup();
+      break;
+    }
+    if (ic >= prev) stall++;
+    else stall = 0;
+    if (stall >= 2) {
+      stopReason = "stalled";
+      history.push({ pass, issueCount: ic, applied: 0, attempted: 0 });
+      await result.cleanup();
+      break;
+    }
+    if (pass >= maxPasses) {
+      stopReason = "max-passes";
+      history.push({ pass, issueCount: ic, applied: 0, attempted: 0 });
+      await result.cleanup();
+      break;
+    }
+    if (!flags.noFix) {
+      let applied = 0;
+      let attempted = 0;
+      for (const issue of result.issues) {
+        const strategies = FIX_STRATEGIES[issue.fixStrategy] || [];
+        if (issue.fixAttempts >= strategies.length) continue;
+        attempted++;
+        const before = issue.fixAttempts;
+        const res = await applyFix(
+          issue,
+          outDir,
+          result.origPage,
+          result.clonePage,
+        );
+        issue.fixAttempts = before + 1;
+        if (res.ok) {
+          issue.lastFixNotes = res.notes;
+          applied++;
+        }
+      }
+      history.push({ pass, issueCount: ic, applied, attempted });
+      console.log(`   ↻ pass ${pass}: applied ${applied}/${attempted} fix(es)`);
+    } else {
+      stopReason = "no-fix";
+      history.push({ pass, issueCount: ic, applied: 0, attempted: 0 });
+      await result.cleanup();
+      break;
+    }
+    prev = ic;
+    await result.cleanup();
+  }
+  console.log(`\n🔬 v54 loop done: ${stopReason} after ${pass} pass(es)`);
+  return { stopReason, history, finalIssues };
+}
+
 // ─── click-no-op strategies ───────────────────────────────────────────
 
 async function fixClickReinjectHandler(issue, outDir, origPage, clonePage) {
@@ -1977,30 +2059,6 @@ async function fixUnhandledRejection(issue, outDir, origPage, clonePage) {
   }
   fs.writeFileSync(indexPath, html);
   return { ok: true, notes: "injected unhandledrejection silencer" };
-}
-
-// v54 D1: Minimal one-pass fix runner. Each call advances all issues by one strategy step.
-// Phase E1 will replace this with a stall-aware multi-pass loop.
-// Returns { applied, attempted } where `attempted` counts issues that still had
-// a strategy available this pass; the caller can keep iterating while attempted>0
-// even if no fix succeeded, so multi-strategy issues (e.g. click-no-op) get past
-// their stub first strategy.
-async function runFixPass(issues, outDir, origPage, clonePage) {
-  const applied = [];
-  let attempted = 0;
-  for (const issue of issues) {
-    const strategies = FIX_STRATEGIES[issue.fixStrategy] || [];
-    if (issue.fixAttempts >= strategies.length) continue; // no strategy left
-    attempted++;
-    const before = issue.fixAttempts;
-    const res = await applyFix(issue, outDir, origPage, clonePage);
-    issue.fixAttempts = before + 1;
-    if (res.ok) {
-      issue.lastFixNotes = res.notes;
-      applied.push(issue);
-    }
-  }
-  return { applied, attempted };
 }
 
 // v54 C4: dedupAnimationIssues — collapse animation-family issues per
@@ -5464,38 +5522,14 @@ async function main() {
       headless: !flags.interactive,
     });
     try {
-      const result = await runVerifyPhase(targetDir, browser, flags);
+      // v54 E1: stall-aware multi-pass verify+fix loop (replaces D1 one-pass runner).
+      const loopResult = await runUntilClean(targetDir, browser, flags);
       console.log(
-        `Verify-only complete: ${result.issues.length} issues found.`,
+        `Verify-only complete: stopReason=${loopResult.stopReason}, finalIssues=${loopResult.finalIssues.length}`,
       );
-      for (const it of result.issues) {
+      for (const it of loopResult.finalIssues) {
         console.log(`   • ${it.type}  selector=${it.selector}`);
       }
-      // v54 D1: minimal one-pass fix loop (E1 will replace this with a stall-aware loop)
-      if (!flags.noFix) {
-        const maxPasses = flags.maxPasses || 5;
-        let pass = 0;
-        while (pass < maxPasses) {
-          pass++;
-          const { applied, attempted } = await runFixPass(
-            result.issues,
-            targetDir,
-            result.origPage,
-            result.clonePage,
-          );
-          if (applied.length > 0) {
-            console.log(`   ↻ pass ${pass}: applied ${applied.length} fix(es)`);
-          } else if (attempted > 0) {
-            console.log(
-              `   ↻ pass ${pass}: ${attempted} strateg${attempted === 1 ? "y" : "ies"} attempted, none succeeded`,
-            );
-          } else {
-            console.log(`   ↻ pass ${pass}: no strategies left (stable)`);
-            break;
-          }
-        }
-      }
-      await result.cleanup();
     } finally {
       await browser.close();
     }
@@ -7095,36 +7129,24 @@ ${stubFooter || ""}
   // v54: Verify + fix loop (skip if --no-verify)
   if (!flags.noVerify) {
     try {
-      const result = await runVerifyPhase(OUT, browser, flags);
-      console.log(`\n  🔬 v54 verify: ${result.issues.length} issues found`);
-      for (const it of result.issues) {
-        console.log(`   • ${it.type}  selector=${it.selector}`);
+      // v54 E1: stall-aware multi-pass loop replaces D1 single-pass runner.
+      const loopResult = await runUntilClean(OUT, browser, flags);
+      console.log(
+        `\n  🔬 v54 verify complete: ${loopResult.stopReason}, ${loopResult.finalIssues.length} unfixable issue(s)`,
+      );
+      // Persist pass history + final status into manifest.json.
+      try {
+        const manifestPath = path.join(OUT, "data", "manifest.json");
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+        manifest.passes = loopResult.history;
+        manifest.finalStatus = loopResult.stopReason;
+        manifest.unfixableIssues = loopResult.finalIssues;
+        fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+      } catch (e) {
+        console.log(
+          `\n  ⚠ could not update manifest.json: ${e.message?.slice(0, 100)}`,
+        );
       }
-      // v54 D1: minimal one-pass fix loop (E1 will replace this with a stall-aware loop)
-      if (!flags.noFix) {
-        const maxPasses = flags.maxPasses || 5;
-        let pass = 0;
-        while (pass < maxPasses) {
-          pass++;
-          const { applied, attempted } = await runFixPass(
-            result.issues,
-            OUT,
-            result.origPage,
-            result.clonePage,
-          );
-          if (applied.length > 0) {
-            console.log(`   ↻ pass ${pass}: applied ${applied.length} fix(es)`);
-          } else if (attempted > 0) {
-            console.log(
-              `   ↻ pass ${pass}: ${attempted} strateg${attempted === 1 ? "y" : "ies"} attempted, none succeeded`,
-            );
-          } else {
-            console.log(`   ↻ pass ${pass}: no strategies left (stable)`);
-            break;
-          }
-        }
-      }
-      await result.cleanup();
     } catch (e) {
       console.log(`\n  ⚠ verify phase failed: ${e.message?.slice(0, 100)}`);
     }
