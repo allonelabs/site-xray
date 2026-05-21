@@ -515,7 +515,13 @@ async function enumeratePages(html, baseURL, framework) {
     // astro/hugo/gatsby: their content is in sitemap.xml — already covered
   }
 
-  return [...enumerated];
+  // Filter out enumerated entries that aren't HTML pages. Sitemap.xml lists
+  // include things like /sitemap-1.xml, /image-sitemap-1.xml — we don't
+  // want to crawl those as if they were content. Also skip common non-
+  // page extensions and feeds.
+  const SKIP_RE =
+    /\.(xml|json|rss|atom|txt|pdf|zip|tar|gz|jpg|jpeg|png|gif|webp|svg|ico|woff2?|ttf|otf|mp4|webm|mov|wav|mp3)(\?|$)/i;
+  return [...enumerated].filter((p) => !SKIP_RE.test(p));
 }
 
 async function main() {
