@@ -691,8 +691,18 @@ async function runVerifyPhase(outDir, browser, flags) {
     // v54 E2: capture per-issue evidence screenshots (orig + clone bbox crops)
     // for any issue with a selector. Animation frame captures are saved inside
     // probeAnimationFrames itself, so this loop only handles bbox screenshots.
-    for (const issue of deduped) {
-      await captureEvidence(outDir, issue, origPage, clonePage);
+    // Skip when the page is poisoned — captureEvidence calls page.evaluate
+    // which would hang the same way the detectors did. Issues still get
+    // logged in pass-N.json without screenshots.
+    if (!pagePoisoned) {
+      for (const issue of deduped) {
+        await Promise.race([
+          captureEvidence(outDir, issue, origPage, clonePage).catch(() => null),
+          new Promise((resolve) => setTimeout(resolve, 8000)),
+        ]);
+      }
+    } else {
+      console.log(`     ⏱ evidence screenshots: skipped (page poisoned)`);
     }
     return {
       issues: deduped,
