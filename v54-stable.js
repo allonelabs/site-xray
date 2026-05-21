@@ -1794,63 +1794,124 @@ function escapeHtml(s) {
 // ─── click-no-op strategies ───────────────────────────────────────────
 
 async function fixClickDelegatedListener(issue, outDir, origPage, clonePage) {
-  // Replay the original click to learn its effect, then synthesize a fix
-  // tailored to that effect:
-  //   - if the click navigated to a different URL → inject a navigation handler
-  //   - if it triggered a non-trivial DOM mutation (panel/dropdown) → no fix
-  //     yet (interactive replay is a follow-up); return ok:false with notes
-  const recipe = await origPage
-    .evaluate(async (sel) => {
+  // Replay the original click to learn its effect, then synthesize a fix:
+  //   1) navigation — inject a delegated handler that sets location.href
+  //   2) DOM mutation (panel/dropdown) — capture the post-click subtree and
+  //      inject a one-shot handler that swaps it in on first click
+  //
+  // For (2) the page was likely already clicked once during probeClick, so
+  // we reload origPage first to recover a clean pre-click state.
+  let recipe;
+  try {
+    await origPage.reload({ waitUntil: "domcontentloaded", timeout: 20000 });
+    await origPage.waitForTimeout(1200);
+    recipe = await origPage.evaluate(async (sel) => {
       const el = document.querySelector(sel);
       if (!el) return null;
       const beforeURL = location.href;
-      const beforeLen = document.body.innerHTML.length;
+      const beforeHTML = document.body.innerHTML;
       el.click();
-      await new Promise((r) => setTimeout(r, 600));
-      return {
-        beforeURL,
-        afterURL: location.href,
-        beforeLen,
-        afterLen: document.body.innerHTML.length,
-      };
-    }, issue.selector)
-    .catch(() => null);
-  if (!recipe)
-    return { ok: false, notes: "could not record original handler effect" };
-  const navigated = recipe.afterURL !== recipe.beforeURL;
-  if (!navigated) {
+      await new Promise((r) => setTimeout(r, 800));
+      const afterURL = location.href;
+      const afterHTML = document.body.innerHTML;
+      return { beforeURL, afterURL, beforeHTML, afterHTML };
+    }, issue.selector);
+  } catch (e) {
     return {
       ok: false,
-      notes: `click triggered DOM mutation (${recipe.afterLen - recipe.beforeLen} chars) but no navigation — interactive-panel replay not yet implemented`,
+      notes: `recipe-capture failed: ${(e.message || "").slice(0, 80)}`,
     };
   }
-  // recipe.afterURL is on the LIVE origin. For same-origin nav, rewrite to a
-  // path-relative target so the clone (served from a local server) stays in
-  // the clone instead of redirecting to the live site. External-domain nav
-  // stays absolute.
-  let navTarget;
-  try {
-    const beforeOrigin = new URL(recipe.beforeURL).origin;
-    const after = new URL(recipe.afterURL);
-    navTarget =
-      after.origin === beforeOrigin
-        ? after.pathname + after.search + after.hash
-        : recipe.afterURL;
-  } catch {
-    navTarget = recipe.afterURL;
-  }
+  if (!recipe)
+    return { ok: false, notes: "could not record original handler effect" };
+
   const indexPath = path.join(outDir, "index.html");
   if (!fs.existsSync(indexPath))
     return { ok: false, notes: "index.html missing" };
   let html = fs.readFileSync(indexPath, "utf-8");
   const sentinel = `<!--v54-fix:${issue.id}-->`;
   if (html.includes(sentinel)) return { ok: false, notes: "already attempted" };
-  const stub = `\n${sentinel}\n<script>document.addEventListener('click', function(e) { var t = e.target; while (t && t !== document.body) { if (t.matches && t.matches(${JSON.stringify(issue.selector)})) { e.preventDefault(); window.location.href = ${JSON.stringify(navTarget)}; return; } t = t.parentElement; } });</script>\n`;
+
+  const navigated = recipe.afterURL !== recipe.beforeURL;
+  if (navigated) {
+    // Same-origin: rewrite to a path so the clone stays self-contained.
+    let navTarget;
+    try {
+      const beforeOrigin = new URL(recipe.beforeURL).origin;
+      const after = new URL(recipe.afterURL);
+      navTarget =
+        after.origin === beforeOrigin
+          ? after.pathname + after.search + after.hash
+          : recipe.afterURL;
+    } catch {
+      navTarget = recipe.afterURL;
+    }
+    const stub = `\n${sentinel}\n<script>document.addEventListener('click', function(e) { var t = e.target; while (t && t !== document.body) { if (t.matches && t.matches(${JSON.stringify(issue.selector)})) { e.preventDefault(); window.location.href = ${JSON.stringify(navTarget)}; return; } t = t.parentElement; } });</script>\n`;
+    html = html.replace("</body>", stub + "</body>");
+    fs.writeFileSync(indexPath, html);
+    return { ok: true, notes: `injected navigation handler → ${navTarget}` };
+  }
+
+  // Mutation replay: extract the diff region (typically a modal/panel that
+  // appears) by stripping the common prefix+suffix of before/after, then
+  // inject a handler that appends just that fragment on first matching
+  // click. Appending preserves the rest of the page, so the other cards in
+  // a list (cards 2..N) keep working when each has its own fix injected.
+  if (recipe.afterHTML === recipe.beforeHTML) {
+    return {
+      ok: false,
+      notes: "click had no observable effect on reload — non-deterministic",
+    };
+  }
+  const before = recipe.beforeHTML;
+  const after = recipe.afterHTML;
+  const maxLen = Math.min(before.length, after.length);
+  let prefix = 0;
+  while (prefix < maxLen && before[prefix] === after[prefix]) prefix++;
+  let suffix = 0;
+  while (
+    suffix < maxLen - prefix &&
+    before[before.length - 1 - suffix] === after[after.length - 1 - suffix]
+  )
+    suffix++;
+  // The diff region is the part of `after` that is not in `before`. For a
+  // modal appended to body this is the modal HTML; for in-place updates it
+  // captures whichever subtree React/etc. changed.
+  const diff = after.slice(prefix, after.length - suffix);
+  const diffBytes = Buffer.byteLength(diff, "utf-8");
+  // Lower bound — below this it's noise (attribute flips, whitespace).
+  if (diffBytes < 200) {
+    return {
+      ok: false,
+      notes: `mutation diff too small (${diffBytes} bytes) — probably a no-op`,
+    };
+  }
+  // Upper bound — full-body swaps drag in scripts that error in a static
+  // clone. The previous version blew the error budget (5 console errors
+  // per page); capping at 200KB keeps the payload to the modal itself.
+  if (diffBytes > 200000) {
+    return {
+      ok: false,
+      notes: `mutation diff too large (${(diffBytes / 1024).toFixed(0)}KB > 200KB cap)`,
+    };
+  }
+  // Router pattern: ONE outer click handler routes to the right fix via a
+  // shared global registry (window.__v54Fixes). Each per-issue fix just
+  // pushes its {sel, diff} entry. This avoids N independent closures whose
+  // "modal-open" states would otherwise contradict each other when the user
+  // clicks card 2 after opening card 1 (each closure would think its own
+  // modal is open and try to close it on the next click).
+  const routerSentinel = `<!--v54-fix-router-->`;
+  if (!html.includes(routerSentinel)) {
+    const routerScript = `\n${routerSentinel}\n<script>(function(){if(window.__v54Init)return;window.__v54Init=true;window.__v54Fixes=window.__v54Fixes||[];window.__v54Active=null;document.addEventListener('click',function(e){var a=window.__v54Active;if(a){if(!a.contains(e.target)){a.remove();window.__v54Active=null;}return;}var t=e.target;while(t&&t!==document.body){for(var i=0;i<window.__v54Fixes.length;i++){var f=window.__v54Fixes[i];if(t.matches&&t.matches(f.sel)){e.preventDefault();var wrap=document.createElement('div');wrap.setAttribute('data-v54-replay',f.id);wrap.innerHTML=f.diff;document.body.appendChild(wrap);window.__v54Active=wrap;return;}}t=t.parentElement;}},true);})();</script>\n`;
+    html = html.replace("</body>", routerScript + "</body>");
+  }
+  const stub = `\n${sentinel}\n<script>(window.__v54Fixes=window.__v54Fixes||[]).push({id:${JSON.stringify(issue.id)},sel:${JSON.stringify(issue.selector)},diff:${JSON.stringify(diff)}});</script>\n`;
   html = html.replace("</body>", stub + "</body>");
   fs.writeFileSync(indexPath, html);
   return {
     ok: true,
-    notes: `injected navigation handler → ${navTarget}`,
+    notes: `injected diff-replay (${(diffBytes / 1024).toFixed(1)}KB diff of ${(after.length / 1024).toFixed(0)}KB after-state)`,
   };
 }
 

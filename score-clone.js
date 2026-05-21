@@ -1,0 +1,510 @@
+#!/usr/bin/env node
+/**
+ * score-clone.js — site-xray accuracy measurement.
+ *
+ * Renders a live URL and a clone directory side-by-side, scores accuracy
+ * across five dimensions, prints a readable summary and writes JSON.
+ *
+ * Usage: node score-clone.js <live-url> <clone-dir> [--out <json-path>] [--page <route>]
+ *
+ * Dimensions (weights default but adjustable):
+ *   visual       (35%)  pixel-diff ratio between full-page screenshots
+ *   structural   (15%)  DOM node counts, visible elements, links/buttons/forms
+ *   errors       (15%)  console.error count parity
+ *   assets       (15%)  count of 200-OK network responses
+ *   interactive  (20%)  click-behavior parity on up to 20 candidates
+ *
+ * Each dimension is 0–100. Overall is the weighted average.
+ */
+
+const { chromium } = require("playwright");
+const fs = require("fs");
+const path = require("path");
+const { spawn } = require("child_process");
+const net = require("net");
+
+const WEIGHTS = {
+  visual: 0.35,
+  structural: 0.15,
+  errors: 0.15,
+  assets: 0.15,
+  interactive: 0.2,
+};
+
+function parseArgs(argv) {
+  const args = { positional: [], out: null, page: "/" };
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--out") args.out = argv[++i];
+    else if (argv[i] === "--page") args.page = argv[++i];
+    else args.positional.push(argv[i]);
+  }
+  return args;
+}
+
+function probePort(port) {
+  return new Promise((resolve) => {
+    const s = net.connect({ port, host: "127.0.0.1" });
+    s.once("connect", () => {
+      s.destroy();
+      resolve(true);
+    });
+    s.once("error", () => resolve(false));
+    setTimeout(() => {
+      s.destroy();
+      resolve(false);
+    }, 250);
+  });
+}
+
+async function startLocalServer(dir) {
+  // Try ports 3050..3099 until one accepts
+  for (let port = 3050; port < 3100; port++) {
+    if (await probePort(port)) continue;
+    const srv = spawn("python3", ["-m", "http.server", String(port)], {
+      cwd: dir,
+      stdio: "ignore",
+    });
+    const start = Date.now();
+    while (Date.now() - start < 5000) {
+      await new Promise((r) => setTimeout(r, 80));
+      if (await probePort(port)) {
+        return {
+          url: `http://localhost:${port}`,
+          kill: () => {
+            try {
+              srv.kill();
+            } catch {}
+          },
+        };
+      }
+    }
+    srv.kill();
+    throw new Error(`could not start local server on port ${port}`);
+  }
+  throw new Error("no free port in 3050..3099");
+}
+
+function parityScore(a, b) {
+  if (a === 0 && b === 0) return 100;
+  if (a === 0 || b === 0) return 0;
+  return Math.round(Math.min(a / b, b / a) * 100);
+}
+
+function clamp01(x) {
+  return Math.max(0, Math.min(1, x));
+}
+
+// ─── visual ──────────────────────────────────────────────────────────────
+// Take full-page screenshots, downsample to 512px wide on a canvas in the
+// browser, compute mean-absolute-difference per pixel. Returns ratio 0..1
+// where 0 = identical.
+async function probeVisual(origPage, clonePage) {
+  const [a, b] = await Promise.all([
+    origPage.screenshot({ fullPage: true }),
+    clonePage.screenshot({ fullPage: true }),
+  ]);
+  const ratio = await origPage.evaluate(
+    async ({ aDataUrl, bDataUrl }) => {
+      const load = (src) =>
+        new Promise((res, rej) => {
+          const img = new Image();
+          img.onload = () => res(img);
+          img.onerror = rej;
+          img.src = src;
+        });
+      const [ia, ib] = await Promise.all([load(aDataUrl), load(bDataUrl)]);
+      const W = 512;
+      const ar = ia.naturalHeight / ia.naturalWidth;
+      const br = ib.naturalHeight / ib.naturalWidth;
+      const H = Math.round(W * Math.max(ar, br));
+      const make = (img) => {
+        const c = document.createElement("canvas");
+        c.width = W;
+        c.height = H;
+        const ctx = c.getContext("2d");
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, W, H);
+        const scaledH = Math.round(W * (img.naturalHeight / img.naturalWidth));
+        ctx.drawImage(img, 0, 0, W, scaledH);
+        return ctx.getImageData(0, 0, W, H).data;
+      };
+      const da = make(ia);
+      const db = make(ib);
+      let sum = 0;
+      const n = da.length / 4;
+      for (let i = 0; i < da.length; i += 4) {
+        sum +=
+          Math.abs(da[i] - db[i]) +
+          Math.abs(da[i + 1] - db[i + 1]) +
+          Math.abs(da[i + 2] - db[i + 2]);
+      }
+      return sum / (n * 3 * 255);
+    },
+    {
+      aDataUrl: "data:image/png;base64," + a.toString("base64"),
+      bDataUrl: "data:image/png;base64," + b.toString("base64"),
+    },
+  );
+  return {
+    score: Math.round((1 - clamp01(ratio)) * 100),
+    ratio: Math.round(ratio * 10000) / 10000,
+  };
+}
+
+// ─── structural ──────────────────────────────────────────────────────────
+async function probeStructural(origPage, clonePage) {
+  const snap = (page) =>
+    page.evaluate(() => {
+      const visible = (el) => {
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return false;
+        const cs = getComputedStyle(el);
+        return cs.visibility !== "hidden" && cs.display !== "none";
+      };
+      const all = document.querySelectorAll("*");
+      let visibleCount = 0;
+      for (const el of all) if (visible(el)) visibleCount++;
+      return {
+        total: all.length,
+        visible: visibleCount,
+        links: document.querySelectorAll("a[href]").length,
+        buttons: document.querySelectorAll(
+          'button, [role="button"], input[type="button"], input[type="submit"]',
+        ).length,
+        forms: document.querySelectorAll("form").length,
+        images: document.querySelectorAll("img").length,
+        text: document.body
+          ? document.body.innerText.replace(/\s+/g, " ").trim().length
+          : 0,
+      };
+    });
+  const a = await snap(origPage);
+  const b = await snap(clonePage);
+  const components = [
+    parityScore(a.total, b.total),
+    parityScore(a.visible, b.visible),
+    parityScore(a.links, b.links),
+    parityScore(a.buttons, b.buttons),
+    parityScore(a.forms, b.forms),
+    parityScore(a.images, b.images),
+    parityScore(a.text, b.text),
+  ];
+  return {
+    score: Math.round(
+      components.reduce((x, y) => x + y, 0) / components.length,
+    ),
+    orig: a,
+    clone: b,
+  };
+}
+
+// ─── errors ──────────────────────────────────────────────────────────────
+function attachErrorCounter(page) {
+  const state = { count: 0, samples: [] };
+  page.on("console", (msg) => {
+    if (msg.type() === "error") {
+      state.count++;
+      if (state.samples.length < 5)
+        state.samples.push(msg.text().slice(0, 120));
+    }
+  });
+  page.on("pageerror", (err) => {
+    state.count++;
+    if (state.samples.length < 5)
+      state.samples.push("pageerror: " + (err.message || "").slice(0, 100));
+  });
+  return state;
+}
+
+function scoreErrors(origState, cloneState) {
+  // Clone shouldn't introduce errors beyond what the live site has.
+  const extra = Math.max(0, cloneState.count - origState.count);
+  return Math.max(0, 100 - extra * 10);
+}
+
+// ─── assets ──────────────────────────────────────────────────────────────
+function attachAssetCounter(page) {
+  const state = { ok: 0, fail: 0 };
+  page.on("response", (res) => {
+    const status = res.status();
+    if (status >= 200 && status < 400) state.ok++;
+    else if (status >= 400) state.fail++;
+  });
+  return state;
+}
+
+function scoreAssets(origState, cloneState) {
+  return parityScore(origState.ok, cloneState.ok);
+}
+
+// ─── interactive ─────────────────────────────────────────────────────────
+// On both pages, click up to 20 candidate elements (same selectors). Classify
+// each click's behavior into a bucket (no-act, dom-act, panel-open, navigate).
+// Score = pages where buckets match / total tested * 100.
+async function probeInteractive(origPage, clonePage) {
+  const candidates = await origPage.evaluate(() => {
+    const sel =
+      'button, a[href], [role="button"], [role="link"], input[type="submit"], input[type="button"]';
+    const out = [];
+    const seen = new Set();
+    for (const el of document.querySelectorAll(sel)) {
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      if (r.top > window.innerHeight * 3) continue;
+      let s = null;
+      if (el.id) s = "#" + CSS.escape(el.id);
+      else {
+        let cur = el;
+        const parts = [];
+        for (let i = 0; cur && i < 4; i++) {
+          let part = cur.tagName.toLowerCase();
+          const p = cur.parentElement;
+          if (p) {
+            const sibs = Array.from(p.children).filter(
+              (s) => s.tagName === cur.tagName,
+            );
+            if (sibs.length > 1)
+              part += `:nth-of-type(${sibs.indexOf(cur) + 1})`;
+          }
+          parts.unshift(part);
+          cur = p;
+        }
+        s = parts.join(" > ");
+      }
+      if (s && !seen.has(s)) {
+        seen.add(s);
+        out.push(s);
+      }
+      if (out.length >= 20) break;
+    }
+    return out;
+  });
+
+  const clickAndClassify = async (page, selector) => {
+    return await page.evaluate(async (sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return { missing: true };
+      const beforeURL = location.href;
+      const beforeBytes = document.body.innerHTML.length;
+      const openBefore = document.querySelectorAll(
+        '[aria-expanded="true"], [data-state="open"]',
+      ).length;
+      let mutations = 0;
+      const obs = new MutationObserver((r) => {
+        mutations += r.length;
+      });
+      obs.observe(document.body, {
+        attributes: true,
+        childList: true,
+        subtree: true,
+        characterData: true,
+      });
+      try {
+        el.click();
+      } catch {}
+      await new Promise((r) => setTimeout(r, 500));
+      obs.disconnect();
+      const openAfter = document.querySelectorAll(
+        '[aria-expanded="true"], [data-state="open"]',
+      ).length;
+      const afterBytes = document.body.innerHTML.length;
+      const byteDelta = Math.abs(afterBytes - beforeBytes);
+      const navigated = location.href !== beforeURL;
+      // Classify on multiple signals — frameworks like React batch many DOM
+      // changes into one MutationRecord, and snapshot-style fixes do exactly
+      // one childList swap. Treat large body-byte deltas as evidence of
+      // meaningful action even with low mutation counts.
+      let bucket = "no-act";
+      if (navigated) bucket = "navigate";
+      else if (openAfter > openBefore) bucket = "panel-open";
+      else if (mutations >= 10 || byteDelta >= 2000) bucket = "dom-act";
+      return {
+        missing: false,
+        bucket,
+        mutations,
+        byteDelta,
+        navigated,
+      };
+    }, selector);
+  };
+
+  let matched = 0;
+  let tested = 0;
+  const samples = [];
+  for (const sel of candidates) {
+    const a = await clickAndClassify(origPage, sel);
+    const b = await clickAndClassify(clonePage, sel);
+    if (a.missing || b.missing) continue;
+    tested++;
+    const ok = a.bucket === b.bucket;
+    if (ok) matched++;
+    if (samples.length < 6)
+      samples.push({
+        sel: sel.slice(0, 60),
+        orig: a.bucket,
+        clone: b.bucket,
+        ok,
+      });
+    // After a navigate, the next click on the same page would target a
+    // different DOM — stop on navigation so the run stays comparable.
+    if (a.bucket === "navigate" || b.bucket === "navigate") break;
+  }
+  return {
+    score: tested === 0 ? 100 : Math.round((matched / tested) * 100),
+    tested,
+    matched,
+    samples,
+  };
+}
+
+// ─── main ────────────────────────────────────────────────────────────────
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  if (args.positional.length < 2) {
+    console.log(`Usage: node score-clone.js <live-url> <clone-dir> [--out file.json] [--page /route]
+
+Scores a site-xray clone against its live origin across five dimensions.
+Default page is "/". Use --page to score a specific subpage.
+
+Output is printed to stdout. Pass --out to also write JSON.`);
+    process.exit(1);
+  }
+  const [liveURL, cloneDir] = args.positional;
+  if (!fs.existsSync(cloneDir)) {
+    console.error(`clone dir does not exist: ${cloneDir}`);
+    process.exit(1);
+  }
+
+  const liveTarget = new URL(args.page || "/", liveURL).toString();
+  const server = await startLocalServer(cloneDir);
+  const cloneTarget = new URL(args.page || "/", server.url).toString();
+
+  const browser = await chromium.launch();
+  const orig = await browser.newContext({
+    viewport: { width: 1440, height: 900 },
+    ignoreHTTPSErrors: true,
+  });
+  const clone = await browser.newContext({
+    viewport: { width: 1440, height: 900 },
+    ignoreHTTPSErrors: true,
+  });
+  const origPage = await orig.newPage();
+  const clonePage = await clone.newPage();
+  const origErrors = attachErrorCounter(origPage);
+  const cloneErrors = attachErrorCounter(clonePage);
+  const origAssets = attachAssetCounter(origPage);
+  const cloneAssets = attachAssetCounter(clonePage);
+
+  try {
+    await Promise.all([
+      origPage.goto(liveTarget, { waitUntil: "networkidle", timeout: 30000 }),
+      clonePage.goto(cloneTarget, {
+        waitUntil: "domcontentloaded",
+        timeout: 20000,
+      }),
+    ]);
+    // Give both pages a moment to settle (lazy images, animations, etc.)
+    await Promise.all([
+      origPage.waitForTimeout(2500),
+      clonePage.waitForTimeout(2500),
+    ]);
+
+    const visual = await probeVisual(origPage, clonePage);
+    const structural = await probeStructural(origPage, clonePage);
+    const interactive = await probeInteractive(origPage, clonePage);
+
+    const errors = {
+      score: scoreErrors(origErrors, cloneErrors),
+      orig: origErrors,
+      clone: cloneErrors,
+    };
+    const assets = {
+      score: scoreAssets(origAssets, cloneAssets),
+      orig: origAssets,
+      clone: cloneAssets,
+    };
+
+    const overall = Math.round(
+      visual.score * WEIGHTS.visual +
+        structural.score * WEIGHTS.structural +
+        errors.score * WEIGHTS.errors +
+        assets.score * WEIGHTS.assets +
+        interactive.score * WEIGHTS.interactive,
+    );
+
+    const result = {
+      live: liveTarget,
+      clone: cloneTarget,
+      cloneDir,
+      ranAt: new Date().toISOString(),
+      scores: {
+        visual: visual.score,
+        structural: structural.score,
+        errors: errors.score,
+        assets: assets.score,
+        interactive: interactive.score,
+        overall,
+      },
+      weights: WEIGHTS,
+      details: { visual, structural, errors, assets, interactive },
+    };
+
+    const bar = (n) => {
+      const w = 30;
+      const filled = Math.round((n / 100) * w);
+      return "█".repeat(filled) + "·".repeat(w - filled);
+    };
+    const pad = (s, n) => (s + " ".repeat(n)).slice(0, n);
+
+    console.log("");
+    console.log(`  Site X-Ray — accuracy score`);
+    console.log(`  live  ${liveTarget}`);
+    console.log(`  clone ${cloneTarget}  (${cloneDir})`);
+    console.log("");
+    for (const k of [
+      "visual",
+      "structural",
+      "errors",
+      "assets",
+      "interactive",
+    ]) {
+      const s = result.scores[k];
+      console.log(`  ${pad(k, 12)} ${bar(s)}  ${String(s).padStart(3)}/100`);
+    }
+    console.log(
+      `  ${pad("OVERALL", 12)} ${bar(overall)}  ${String(overall).padStart(3)}/100`,
+    );
+    console.log("");
+    console.log(
+      `  details:  visual-diff ${(visual.ratio * 100).toFixed(1)}%  ·  ` +
+        `dom ${structural.clone.total}/${structural.orig.total}  ·  ` +
+        `errors ${cloneErrors.count}/${origErrors.count}  ·  ` +
+        `assets ${cloneAssets.ok}/${origAssets.ok}  ·  ` +
+        `interactive ${interactive.matched}/${interactive.tested}`,
+    );
+    if (interactive.samples.length) {
+      console.log("");
+      console.log("  interactive samples:");
+      for (const s of interactive.samples) {
+        const mark = s.ok ? "✓" : "✗";
+        console.log(
+          `    ${mark}  ${pad(s.orig, 12)} vs ${pad(s.clone, 12)}  ${s.sel}`,
+        );
+      }
+    }
+    console.log("");
+
+    if (args.out) {
+      fs.writeFileSync(args.out, JSON.stringify(result, null, 2));
+      console.log(`  → ${args.out}`);
+    }
+  } finally {
+    await browser.close();
+    server.kill();
+  }
+}
+
+main().catch((e) => {
+  console.error(e.stack || e.message || e);
+  process.exit(1);
+});
