@@ -498,9 +498,30 @@ async function runVerifyPhase(outDir, browser, flags) {
       waitUntil: "domcontentloaded",
       timeout: 15000,
     });
-    // v54 C1: interactionProbe — click detection
+    // v54 C2: inject PIXEL_DIFF_SRC via addScriptTag (NOT evaluate) so
+    // pixelDiff becomes a window-global on both pages and is callable from
+    // subsequent page.evaluate() calls in probeHover.
+    await origPage.addScriptTag({ content: PIXEL_DIFF_SRC });
+    await clonePage.addScriptTag({ content: PIXEL_DIFF_SRC });
+    // v54 C1+C2: interactionProbe — click + hover + form audit
     const issues = [];
+    // Build an ID-only candidate list for probeHover (simpler than
+    // probeClick's selector resolver and adequate for the hover heuristic).
+    const hoverCandidates = await origPage.evaluate(() => {
+      const sel =
+        'button, a[href], [role="button"], [role="link"], [role="menuitem"], input[type="submit"], input[type="button"], [onclick]';
+      return Array.from(document.querySelectorAll(sel))
+        .filter((el) => {
+          const r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0 && r.top < window.innerHeight * 2;
+        })
+        .slice(0, 50)
+        .map((el) => (el.id ? "#" + CSS.escape(el.id) : null))
+        .filter(Boolean);
+    });
     issues.push(...(await probeClick(origPage, clonePage, flags)));
+    issues.push(...(await probeHover(origPage, clonePage, hoverCandidates)));
+    issues.push(...(await auditForms(clonePage)));
     return {
       issues,
       origPage,
@@ -716,6 +737,164 @@ async function observeClick(page, selector, timeoutMs) {
     navigated: result.navigated || navigated,
     consoleErrors,
   };
+}
+
+// v54 C2: screenshotElementBox — capture a tight bbox screenshot of `selector`
+// after optionally applying a pseudo-state.
+//
+// Deviation from the plan: we use Playwright's `page.hover(selector)` and
+// `page.focus(selector)` instead of dispatching synthetic MouseEvents. The
+// spec'd `dispatchEvent(MouseEvent("mouseenter"))` approach DOES NOT trigger
+// the `:hover` pseudo-class in any browser engine — only real cursor input
+// (or CDP's Input.dispatchMouseEvent, which is what page.hover uses
+// internally) applies that pseudo-state. Same story for `:focus`.
+async function screenshotElementBox(page, selector, pseudoAction) {
+  try {
+    if (pseudoAction === ":hover") {
+      await page.hover(selector).catch(() => {});
+    } else if (pseudoAction === ":focus") {
+      await page.focus(selector).catch(() => {});
+    }
+    await page.waitForTimeout(pseudoAction === ":hover" ? 400 : 200);
+    const elHandle = await page.$(selector).catch(() => null);
+    if (!elHandle) return null;
+    const box = await elHandle.boundingBox();
+    if (!box) return null;
+    return await page.screenshot({
+      clip: {
+        x: Math.max(0, box.x - 16),
+        y: Math.max(0, box.y - 16),
+        width: box.width + 32,
+        height: box.height + 32,
+      },
+    });
+  } catch (e) {
+    logCaptureError(`screenshotElementBox:${selector}:${pseudoAction}`, e);
+    return null;
+  }
+}
+
+// v54 C2: probeHover — for each candidate, take bbox screenshots
+// idle vs :hover on both orig and clone; if orig's hover-diff ratio is high
+// but clone's is near zero, the clone is missing the hover style.
+async function probeHover(origPage, clonePage, candidates) {
+  const issues = [];
+  for (const selector of candidates) {
+    try {
+      const origIdle = await screenshotElementBox(origPage, selector, null);
+      const origHover = await screenshotElementBox(
+        origPage,
+        selector,
+        ":hover",
+      );
+      const cloneIdle = await screenshotElementBox(clonePage, selector, null);
+      const cloneHover = await screenshotElementBox(
+        clonePage,
+        selector,
+        ":hover",
+      );
+      if (!origIdle || !origHover || !cloneIdle || !cloneHover) continue;
+
+      const origIdleURL = `data:image/png;base64,${origIdle.toString("base64")}`;
+      const origHoverURL = `data:image/png;base64,${origHover.toString("base64")}`;
+      const cloneIdleURL = `data:image/png;base64,${cloneIdle.toString("base64")}`;
+      const cloneHoverURL = `data:image/png;base64,${cloneHover.toString("base64")}`;
+
+      const origRatio = await origPage.evaluate(
+        async ({ a, b }) => {
+          const r = await pixelDiff(a, b, { downsampleW: 512, threshold: 24 });
+          return r.ratio;
+        },
+        { a: origIdleURL, b: origHoverURL },
+      );
+      const cloneRatio = await clonePage.evaluate(
+        async ({ a, b }) => {
+          const r = await pixelDiff(a, b, { downsampleW: 512, threshold: 24 });
+          return r.ratio;
+        },
+        { a: cloneIdleURL, b: cloneHoverURL },
+      );
+
+      // Heuristic: original shows >=3% visual change on hover; clone shows
+      // <=0.5%. That's strong evidence the :hover style didn't survive.
+      if (origRatio >= 0.03 && cloneRatio <= 0.005) {
+        issues.push({
+          id: issueId("missing-hover", selector, { w: 1440, h: 900 }),
+          type: "missing-hover",
+          selector,
+          viewport: { w: 1440, h: 900 },
+          evidence: {
+            origHoverRatio: origRatio,
+            cloneHoverRatio: cloneRatio,
+          },
+          fixStrategy: "missing-hover",
+          fixAttempts: 0,
+          resolvedInPass: null,
+        });
+      }
+    } catch (e) {
+      logCaptureError(`probeHover:${selector}`, e);
+    }
+  }
+  return issues;
+}
+
+// v54 C2: auditForms — flag forms whose action attribute points off-host
+// (typically a leftover absolute URL to the original site after cloning).
+// We resolve action against the clone's own location and compare hostnames.
+async function auditForms(clonePage) {
+  const issues = [];
+  let entries = [];
+  try {
+    entries = await clonePage.evaluate(() => {
+      const localHost = window.location.hostname;
+      const out = [];
+      for (const f of document.querySelectorAll("form")) {
+        const raw = f.getAttribute("action") || "";
+        if (!raw) continue;
+        let parsed = null;
+        try {
+          parsed = new URL(raw, window.location.href);
+        } catch {
+          continue;
+        }
+        out.push({
+          action: raw,
+          resolved: parsed.href,
+          hostname: parsed.hostname,
+          localHost,
+          method: (f.getAttribute("method") || "get").toLowerCase(),
+          id: f.id || null,
+        });
+      }
+      return out;
+    });
+  } catch (e) {
+    logCaptureError("auditForms:enumerate", e);
+    return issues;
+  }
+  for (const e of entries) {
+    if (e.hostname && e.hostname !== e.localHost) {
+      const selector = e.id ? "#" + e.id : "form";
+      issues.push({
+        id: issueId("broken-form-action", selector, { w: 1440, h: 900 }),
+        type: "broken-form-action",
+        selector,
+        viewport: { w: 1440, h: 900 },
+        evidence: {
+          action: e.action,
+          resolved: e.resolved,
+          hostname: e.hostname,
+          localHost: e.localHost,
+          method: e.method,
+        },
+        fixStrategy: "broken-form-action",
+        fixAttempts: 0,
+        resolvedInPass: null,
+      });
+    }
+  }
+  return issues;
 }
 
 function pathToFile(p) {
