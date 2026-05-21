@@ -180,19 +180,21 @@ async function probeStructural(origPage, clonePage) {
     });
   const a = await snap(origPage);
   const b = await snap(clonePage);
-  const components = [
-    parityScore(a.total, b.total),
-    parityScore(a.visible, b.visible),
-    parityScore(a.links, b.links),
-    parityScore(a.buttons, b.buttons),
-    parityScore(a.forms, b.forms),
-    parityScore(a.images, b.images),
-    parityScore(a.text, b.text),
-  ];
+  // Drop raw "total" gross node count — frameworks render internal nodes
+  // the clone doesn't need. What a user can perceive is visible elements,
+  // text content, and interactive affordances.
+  const breakdown = {
+    visible: parityScore(a.visible, b.visible),
+    links: parityScore(a.links, b.links),
+    buttons: parityScore(a.buttons, b.buttons),
+    forms: parityScore(a.forms, b.forms),
+    images: parityScore(a.images, b.images),
+    text: parityScore(a.text, b.text),
+  };
+  const values = Object.values(breakdown);
   return {
-    score: Math.round(
-      components.reduce((x, y) => x + y, 0) / components.length,
-    ),
+    score: Math.round(values.reduce((x, y) => x + y, 0) / values.length),
+    breakdown,
     orig: a,
     clone: b,
   };
@@ -223,18 +225,51 @@ function scoreErrors(origState, cloneState) {
 }
 
 // ─── assets ──────────────────────────────────────────────────────────────
+// Classify a URL into a "category" that maps to what a user perceives. JS
+// bundles and analytics requests are *deliberately* dropped by site-xray's
+// --visual mode (the clone is a static snapshot) — counting them would
+// penalize the clone for behaving correctly. Score only categories that
+// affect what the user sees.
+function classifyURL(u) {
+  if (
+    /googletagmanager|google-analytics|googleads|doubleclick|facebook\.net|fbq|hotjar|segment|mixpanel|amplitude|posthog|datadog|sentry|fullstory|cookiebot|onetrust|clarity\.ms/i.test(
+      u,
+    )
+  )
+    return "analytics";
+  if (/\.(woff2?|ttf|otf|eot)(\?|$)/i.test(u)) return "font";
+  if (/\.(png|jpe?g|gif|webp|avif|svg|ico)(\?|$)/i.test(u)) return "image";
+  if (/\.(mp4|webm|mov|m4v)(\?|$)/i.test(u)) return "video";
+  if (/\.(css)(\?|$)|fonts\.googleapis\.com\/css/i.test(u)) return "css";
+  if (/\.(js|mjs)(\?|$)/i.test(u)) return "js";
+  return "doc";
+}
+
 function attachAssetCounter(page) {
-  const state = { ok: 0, fail: 0 };
+  const state = { counts: {}, urls: [] };
   page.on("response", (res) => {
     const status = res.status();
-    if (status >= 200 && status < 400) state.ok++;
-    else if (status >= 400) state.fail++;
+    if (status < 200 || status >= 300) return;
+    const cat = classifyURL(res.url());
+    state.counts[cat] = (state.counts[cat] || 0) + 1;
+    state.urls.push({ url: res.url(), cat });
   });
   return state;
 }
 
 function scoreAssets(origState, cloneState) {
-  return parityScore(origState.ok, cloneState.ok);
+  // Categories that affect the visual/content experience. JS and analytics
+  // are intentionally skipped — visual-mode clones don't need them.
+  const cats = ["doc", "css", "image", "font", "video"];
+  const components = cats.map((c) =>
+    parityScore(origState.counts[c] || 0, cloneState.counts[c] || 0),
+  );
+  return {
+    score: Math.round(
+      components.reduce((x, y) => x + y, 0) / components.length,
+    ),
+    perCategory: Object.fromEntries(cats.map((c, i) => [c, components[i]])),
+  };
 }
 
 // ─── interactive ─────────────────────────────────────────────────────────
@@ -418,8 +453,10 @@ Output is printed to stdout. Pass --out to also write JSON.`);
       orig: origErrors,
       clone: cloneErrors,
     };
+    const assetsResult = scoreAssets(origAssets, cloneAssets);
     const assets = {
-      score: scoreAssets(origAssets, cloneAssets),
+      score: assetsResult.score,
+      perCategory: assetsResult.perCategory,
       orig: origAssets,
       clone: cloneAssets,
     };
@@ -475,11 +512,12 @@ Output is printed to stdout. Pass --out to also write JSON.`);
       `  ${pad("OVERALL", 12)} ${bar(overall)}  ${String(overall).padStart(3)}/100`,
     );
     console.log("");
+    const sumOK = (s) => Object.values(s.counts).reduce((x, y) => x + y, 0);
     console.log(
       `  details:  visual-diff ${(visual.ratio * 100).toFixed(1)}%  ·  ` +
-        `dom ${structural.clone.total}/${structural.orig.total}  ·  ` +
+        `visible ${structural.clone.visible}/${structural.orig.visible}  ·  ` +
         `errors ${cloneErrors.count}/${origErrors.count}  ·  ` +
-        `assets ${cloneAssets.ok}/${origAssets.ok}  ·  ` +
+        `assets ${sumOK(cloneAssets)}/${sumOK(origAssets)}  ·  ` +
         `interactive ${interactive.matched}/${interactive.tested}`,
     );
     if (interactive.samples.length) {

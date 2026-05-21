@@ -1852,6 +1852,34 @@ async function fixClickDelegatedListener(issue, outDir, origPage, clonePage) {
     return { ok: true, notes: `injected navigation handler → ${navTarget}` };
   }
 
+  // Rewrite live-origin URLs to clone-local paths in the captured HTML.
+  // The urlMap persisted at clone time has entries like
+  //   "https://example.com/images/profile.png" → "/images/img-0.png"
+  // For each entry we do a global string replace. Sorted longest-first to
+  // avoid clobbering substrings (e.g. ".../foo" before ".../foo/bar").
+  let urlMapForFix = null;
+  try {
+    urlMapForFix = JSON.parse(
+      fs.readFileSync(path.join(outDir, "data", "url-map.json"), "utf-8"),
+    );
+  } catch {}
+  if (urlMapForFix && typeof urlMapForFix === "object") {
+    const entries = Object.entries(urlMapForFix)
+      .filter(([k]) => typeof k === "string" && k.length > 4)
+      .sort((a, b) => b[0].length - a[0].length);
+    const rewriteHTML = (s) => {
+      let out = s;
+      for (const [from, to] of entries) {
+        if (!out.includes(from)) continue;
+        // Split-join is simpler than building a regex with escaped specials.
+        out = out.split(from).join(to);
+      }
+      return out;
+    };
+    recipe.afterHTML = rewriteHTML(recipe.afterHTML);
+    recipe.beforeHTML = rewriteHTML(recipe.beforeHTML);
+  }
+
   // Mutation replay: extract the diff region (typically a modal/panel that
   // appears) by stripping the common prefix+suffix of before/after, then
   // inject a handler that appends just that fragment on first matching
@@ -7584,6 +7612,22 @@ ${stubFooter || ""}
       JSON.stringify(manifest, null, 2),
     );
     console.log(`     📋 Manifest: data/manifest.json`);
+
+    // Persist urlMap so the verify-phase fix strategies can rewrite
+    // captured-from-live URLs into clone-local paths. Without this, snippets
+    // captured by fixClickDelegatedListener still reference original asset
+    // URLs (e.g. /images/profile.png → renamed to /images/img-0.png in the
+    // clone), causing 404s when the modal is replayed.
+    try {
+      fs.writeFileSync(
+        path.join(OUT, "data", "url-map.json"),
+        JSON.stringify(urlMap, null, 2),
+      );
+    } catch (umErr) {
+      console.log(
+        `     ⚠ url-map.json write failed: ${umErr.message?.slice(0, 60)}`,
+      );
+    }
   } catch (mErr) {
     console.log(
       `     ⚠ Manifest generation failed: ${mErr.message?.slice(0, 60)}`,
