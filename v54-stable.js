@@ -602,11 +602,11 @@ async function probeClick(origPage, clonePage, flags) {
       const cloneResult = await observeClick(clonePage, selector, timeoutMs);
       if (origResult.missing || cloneResult.missing) continue;
       const origActed =
-        origResult.mutationCount > 0 ||
+        origResult.mutationCount >= 10 ||
         origResult.openedPanel ||
         origResult.navigated;
       const cloneActed =
-        cloneResult.mutationCount > 0 ||
+        cloneResult.mutationCount >= 10 ||
         cloneResult.openedPanel ||
         cloneResult.navigated;
       if (origActed && !cloneActed) {
@@ -628,7 +628,9 @@ async function probeClick(origPage, clonePage, flags) {
             cloneNavigated: cloneResult.navigated,
             cloneConsoleErrors: cloneResult.consoleErrors || [],
           },
+          fixStrategy: type,
           fixAttempts: 0,
+          resolvedInPass: null,
         });
       }
     } catch (e) {

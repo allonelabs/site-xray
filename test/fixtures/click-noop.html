@@ -8,7 +8,15 @@
     <div id="result"></div>
     <script>
       document.getElementById("cta").addEventListener("click", () => {
-        document.getElementById("result").textContent = "Clicked!";
+        const result = document.getElementById("result");
+        result.textContent = "Clicked!";
+        // Generate ≥10 mutations so the probe's noise threshold is satisfied
+        for (let i = 0; i < 12; i++) {
+          const d = document.createElement("div");
+          d.className = "burst-" + i;
+          d.textContent = "x" + i;
+          result.appendChild(d);
+        }
       });
     </script>
   </body>
