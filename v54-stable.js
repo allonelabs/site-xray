@@ -1304,7 +1304,10 @@ const FIX_STRATEGIES = {
   ],
   "missing-hover": [fixMissingHover],
   "missing-focus": [fixMissingFocus],
-  // other types populated by D3-D5
+  "missing-animation": [fixMissingAnimation],
+  "visual-drift-animated": [fixMissingAnimation],
+  "scroll-anim-drift": [fixMissingAnimation],
+  // other types populated by D4-D5
 };
 
 async function applyFix(issue, outDir, origPage, clonePage) {
@@ -1591,6 +1594,132 @@ async function fixMissingFocus(issue, outDir, origPage, clonePage) {
     clonePage,
     "focus-visible",
   );
+}
+
+// ─── animation-family strategies (D3) ─────────────────────────────────
+// fixMissingAnimation — extracts the element's running animations from the
+// live original via Web Animations API (el.getAnimations) and serializes
+// each effect's keyframes + timing into a CSS @keyframes block plus a
+// selector rule binding those keyframe sets to the element. If WAA returns
+// nothing (e.g. the animation has already finished by the time the fixer
+// runs), falls back to computed-style's animationName and looks up the
+// matching @keyframes rule in document.styleSheets. Page-level (selectorless)
+// issues defer to fixAnimationByComputedStyleSnapshot. Idempotent via the
+// v54-fix:${issue.id} sentinel.
+async function fixMissingAnimation(issue, outDir, origPage, clonePage) {
+  if (!issue.selector) {
+    // Page-level animation drift — use computed-style snapshot fallback
+    return fixAnimationByComputedStyleSnapshot(
+      issue,
+      outDir,
+      origPage,
+      clonePage,
+    );
+  }
+  const dump = await origPage
+    .evaluate((sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return null;
+      const anims = el.getAnimations({ subtree: false });
+      const result = [];
+      for (const a of anims) {
+        try {
+          const kf = a.effect.getKeyframes();
+          const t = a.effect.getTiming();
+          result.push({
+            keyframes: kf,
+            timing: t,
+            animationName: a.animationName,
+          });
+        } catch {}
+      }
+      // CSS transition fallback
+      const cs = getComputedStyle(el);
+      return {
+        animations: result,
+        transition: cs.transition,
+        animationCSS: {
+          name: cs.animationName,
+          duration: cs.animationDuration,
+          timing: cs.animationTimingFunction,
+          delay: cs.animationDelay,
+          iteration: cs.animationIterationCount,
+          fill: cs.animationFillMode,
+        },
+      };
+    }, issue.selector)
+    .catch(() => null);
+  if (!dump) return { ok: false, notes: "could not dump original animations" };
+
+  let css = "";
+  // Convert Web Animations API keyframes to @keyframes blocks
+  for (let i = 0; i < (dump.animations || []).length; i++) {
+    const anim = dump.animations[i];
+    const animName = anim.animationName || `v54-anim-${issue.id}-${i}`;
+    const kfStr = anim.keyframes
+      .map((k) => {
+        const offset =
+          k.offset != null ? `${(k.offset * 100).toFixed(0)}%` : "0%";
+        const props = Object.entries(k)
+          .filter(([key]) => !["offset", "composite", "easing"].includes(key))
+          .map(
+            ([k, v]) => `${k.replace(/([A-Z])/g, "-$1").toLowerCase()}: ${v}`,
+          )
+          .join(";");
+        return `${offset} { ${props} }`;
+      })
+      .join(" ");
+    css += `@keyframes ${animName} { ${kfStr} }\n`;
+    css += `${issue.selector} { animation-name: ${animName}; animation-duration: ${anim.timing.duration}ms; animation-timing-function: ${anim.timing.easing || "ease"}; animation-delay: ${anim.timing.delay}ms; animation-iteration-count: ${anim.timing.iterations || 1}; animation-fill-mode: ${anim.timing.fill || "none"}; }\n`;
+  }
+  // If no WAA animations, fall back to CSS animation properties + look up @keyframes
+  if (
+    css === "" &&
+    dump.animationCSS &&
+    dump.animationCSS.name &&
+    dump.animationCSS.name !== "none"
+  ) {
+    const animName = dump.animationCSS.name;
+    const keyframes = await origPage.evaluate((name) => {
+      for (const sheet of document.styleSheets) {
+        try {
+          for (const rule of sheet.cssRules) {
+            if (rule.type === CSSRule.KEYFRAMES_RULE && rule.name === name)
+              return rule.cssText;
+          }
+        } catch {}
+      }
+      return null;
+    }, animName);
+    if (keyframes) {
+      css += keyframes + "\n";
+      css += `${issue.selector} { animation: ${animName} ${dump.animationCSS.duration} ${dump.animationCSS.timing} ${dump.animationCSS.delay} ${dump.animationCSS.iteration} ${dump.animationCSS.fill}; }\n`;
+    }
+  }
+  if (css === "") return { ok: false, notes: "no animation data to inject" };
+  const indexPath = path.join(outDir, "index.html");
+  let html = fs.readFileSync(indexPath, "utf-8");
+  const sentinel = `<!--v54-fix:${issue.id}-->`;
+  if (html.includes(sentinel)) return { ok: false, notes: "already attempted" };
+  html = html.replace(
+    "</head>",
+    `\n${sentinel}\n<style>${css}</style>\n</head>`,
+  );
+  fs.writeFileSync(indexPath, html);
+  return { ok: true, notes: `injected animation CSS for ${issue.selector}` };
+}
+
+async function fixAnimationByComputedStyleSnapshot(
+  issue,
+  outDir,
+  origPage,
+  clonePage,
+) {
+  // Fallback for page-level / unselected animation issues — copy original's full <style> set
+  return {
+    ok: false,
+    notes: "page-level animation fix not implemented; manual review needed",
+  };
 }
 
 // v54 D1: Minimal one-pass fix runner. Each call advances all issues by one strategy step.
