@@ -525,6 +525,9 @@ async function runVerifyPhase(outDir, browser, flags) {
     issues.push(...(await probeAnimationTrajectory(origPage, clonePage)));
     issues.push(...(await probeAnimationFrames(origPage, clonePage)));
     issues.push(...(await probeScrollCheckpoint(origPage, clonePage)));
+    issues.push(...(await probeVisualDiff(origPage, clonePage, flags)));
+    // probeConsoleAudit MUST be last: its reload tears down PIXEL_DIFF_SRC.
+    issues.push(...(await probeConsoleAudit(origPage, clonePage)));
     const deduped = dedupAnimationIssues(issues);
     return {
       issues: deduped,
@@ -1161,6 +1164,128 @@ async function probeScrollCheckpoint(origPage, clonePage) {
     } catch (e) {
       logCaptureError(`probeScrollCheckpoint:${pct}`, e);
     }
+  }
+  return issues;
+}
+
+// v54 C5: probeVisualDiff — capture full-page screenshots at one or more
+// viewports, run pixelDiff, and emit `visual-drift` issues per hotRegion of
+// non-trivial area. With --responsive, runs at 1440x900, 768x1024, 375x812;
+// otherwise just 1440x900.
+async function probeVisualDiff(origPage, clonePage, flags) {
+  const issues = [];
+  const viewports = flags.responsive
+    ? [
+        { w: 1440, h: 900 },
+        { w: 768, h: 1024 },
+        { w: 375, h: 812 },
+      ]
+    : [{ w: 1440, h: 900 }];
+  for (const vp of viewports) {
+    try {
+      await origPage.setViewportSize(vp);
+      await clonePage.setViewportSize(vp);
+      await origPage.waitForTimeout(800);
+      await clonePage.waitForTimeout(800);
+      const [a, b] = await Promise.all([
+        origPage.screenshot({ fullPage: true }),
+        clonePage.screenshot({ fullPage: true }),
+      ]);
+      const diff = await origPage.evaluate(
+        async (args) =>
+          pixelDiff(args.a, args.b, { threshold: 32, downsampleW: 1280 }),
+        {
+          a: `data:image/png;base64,${a.toString("base64")}`,
+          b: `data:image/png;base64,${b.toString("base64")}`,
+        },
+      );
+      for (const region of diff.hotRegions) {
+        if (region.w * region.h < 64) continue;
+        issues.push({
+          id: issueId(
+            "visual-drift",
+            `region@${vp.w}x${vp.h}:${region.x},${region.y}`,
+            vp,
+          ),
+          type: "visual-drift",
+          selector: null,
+          viewport: vp,
+          evidence: {
+            diffPx: region.w * region.h,
+            originalBehavior: `region @ ${region.x},${region.y}`,
+            cloneBehavior: "pixel mismatch",
+          },
+          fixStrategy: "visual-drift",
+          fixAttempts: 0,
+          resolvedInPass: null,
+        });
+      }
+    } catch (e) {
+      logCaptureError(`probeVisualDiff:${vp.w}x${vp.h}`, e);
+    }
+  }
+  return issues;
+}
+
+// v54 C5: probeConsoleAudit — reload both pages with console listeners
+// attached, then categorize any clone-specific errors (not already present on
+// the original) as console-error-404, console-error-undefined-global, or
+// console-error-unhandled-rejection.
+//
+// ORDERING INVARIANT: this must be the LAST detector in runVerifyPhase. The
+// reload here tears down the previously-injected PIXEL_DIFF_SRC script tag,
+// so any detector that calls pixelDiff() must run BEFORE probeConsoleAudit.
+async function probeConsoleAudit(origPage, clonePage) {
+  const issues = [];
+  const cloneErrs = [];
+  const origErrs = [];
+  const cloneListener = (msg) => {
+    if (msg.type() === "error") cloneErrs.push(msg.text());
+  };
+  const origListener = (msg) => {
+    if (msg.type() === "error") origErrs.push(msg.text());
+  };
+  clonePage.on("console", cloneListener);
+  origPage.on("console", origListener);
+  // Reload both to capture fresh load-time errors
+  await Promise.all([
+    origPage
+      .reload({ waitUntil: "networkidle", timeout: 15000 })
+      .catch(() => {}),
+    clonePage
+      .reload({ waitUntil: "domcontentloaded", timeout: 15000 })
+      .catch(() => {}),
+  ]);
+  await new Promise((r) => setTimeout(r, 2000));
+  clonePage.off("console", cloneListener);
+  origPage.off("console", origListener);
+  const origSet = new Set(origErrs.map((e) => e.slice(0, 80)));
+  for (const err of cloneErrs) {
+    if (origSet.has(err.slice(0, 80))) continue;
+    let type = "console-error-unhandled-rejection",
+      urlOrName = "";
+    const m404 =
+      err.match(/(\d\d\d)\s.*?(https?:\/\/\S+)/) ||
+      err.match(/Failed to load resource.*?(https?:\/\/\S+)/);
+    if (m404) {
+      type = "console-error-404";
+      urlOrName = m404[m404.length - 1];
+    } else {
+      const mUndef = err.match(/(\w+) is not defined/);
+      if (mUndef) {
+        type = "console-error-undefined-global";
+        urlOrName = mUndef[1];
+      }
+    }
+    issues.push({
+      id: issueId(type, urlOrName, null),
+      type,
+      selector: null,
+      evidence: { consoleMessage: err.slice(0, 200), sourceUrl: urlOrName },
+      fixStrategy: type,
+      fixAttempts: 0,
+      resolvedInPass: null,
+    });
   }
   return issues;
 }
