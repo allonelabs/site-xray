@@ -818,8 +818,12 @@ async function probeClick(origPage, clonePage, flags) {
 
   for (const selector of candidates) {
     try {
-      const origResult = await observeClick(origPage, selector, timeoutMs);
-      const cloneResult = await observeClick(clonePage, selector, timeoutMs);
+      // v54: parallel orig+clone — independent pages, independent observation.
+      // Halves probeClick wall-clock (50 candidates × 800ms × 2 → × 1).
+      const [origResult, cloneResult] = await Promise.all([
+        observeClick(origPage, selector, timeoutMs),
+        observeClick(clonePage, selector, timeoutMs),
+      ]);
       if (origResult.missing || cloneResult.missing) continue;
       // v54: also treat large body-byte deltas as "acted". Snapshot-style
       // fixes (mutation-replay router) do exactly one childList swap which
@@ -1010,18 +1014,30 @@ async function probeHover(origPage, clonePage, candidates) {
   const issues = [];
   for (const selector of candidates) {
     try {
-      const origIdle = await screenshotElementBox(origPage, selector, null);
-      const origHover = await screenshotElementBox(
-        origPage,
-        selector,
-        ":hover",
-      );
-      const cloneIdle = await screenshotElementBox(clonePage, selector, null);
-      const cloneHover = await screenshotElementBox(
-        clonePage,
-        selector,
-        ":hover",
-      );
+      // v54: orig and clone are independent — capture both pairs in parallel.
+      // Within each pair, idle→hover must stay sequential because page.hover
+      // mutates the page's :hover state. Halves probeHover wall-clock.
+      const [[origIdle, origHover], [cloneIdle, cloneHover]] =
+        await Promise.all([
+          (async () => {
+            const idle = await screenshotElementBox(origPage, selector, null);
+            const hover = await screenshotElementBox(
+              origPage,
+              selector,
+              ":hover",
+            );
+            return [idle, hover];
+          })(),
+          (async () => {
+            const idle = await screenshotElementBox(clonePage, selector, null);
+            const hover = await screenshotElementBox(
+              clonePage,
+              selector,
+              ":hover",
+            );
+            return [idle, hover];
+          })(),
+        ]);
       if (!origIdle || !origHover || !cloneIdle || !cloneHover) continue;
 
       const origIdleURL = `data:image/png;base64,${origIdle.toString("base64")}`;
@@ -1029,20 +1045,29 @@ async function probeHover(origPage, clonePage, candidates) {
       const cloneIdleURL = `data:image/png;base64,${cloneIdle.toString("base64")}`;
       const cloneHoverURL = `data:image/png;base64,${cloneHover.toString("base64")}`;
 
-      const origRatio = await origPage.evaluate(
-        async ({ a, b }) => {
-          const r = await pixelDiff(a, b, { downsampleW: 512, threshold: 24 });
-          return r.ratio;
-        },
-        { a: origIdleURL, b: origHoverURL },
-      );
-      const cloneRatio = await clonePage.evaluate(
-        async ({ a, b }) => {
-          const r = await pixelDiff(a, b, { downsampleW: 512, threshold: 24 });
-          return r.ratio;
-        },
-        { a: cloneIdleURL, b: cloneHoverURL },
-      );
+      // Parallel pixel-diff — orig and clone evaluates are independent.
+      const [origRatio, cloneRatio] = await Promise.all([
+        origPage.evaluate(
+          async ({ a, b }) => {
+            const r = await pixelDiff(a, b, {
+              downsampleW: 512,
+              threshold: 24,
+            });
+            return r.ratio;
+          },
+          { a: origIdleURL, b: origHoverURL },
+        ),
+        clonePage.evaluate(
+          async ({ a, b }) => {
+            const r = await pixelDiff(a, b, {
+              downsampleW: 512,
+              threshold: 24,
+            });
+            return r.ratio;
+          },
+          { a: cloneIdleURL, b: cloneHoverURL },
+        ),
+      ]);
 
       // Heuristic: original shows >=3% visual change on hover; clone shows
       // <=0.5%. That's strong evidence the :hover style didn't survive.
