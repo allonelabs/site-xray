@@ -607,14 +607,29 @@ async function runVerifyPhase(outDir, browser, flags) {
     const budgetMs = flags.verifyBudgetMs ?? 300000;
     const elapsedMs = () => Date.now() - verifyStart;
     const remainingMs = () => Math.max(0, budgetMs - elapsedMs());
+    let pagePoisoned = false;
     const run = async (name, fn) => {
       if (remainingMs() === 0) {
         console.log(`     ⏱ ${name}: skipped (verify budget exhausted)`);
         return [];
       }
+      if (pagePoisoned) {
+        console.log(`     ⏱ ${name}: skipped (page poisoned by prior hang)`);
+        return [];
+      }
       const t0 = Date.now();
+      // Wall-clock cap each detector at min(remaining budget, 120s).
+      const perDetectorCap = Math.min(remainingMs(), 120000);
       try {
-        const r = await fn();
+        const r = await Promise.race([
+          Promise.resolve().then(fn),
+          new Promise((_, rej) =>
+            setTimeout(
+              () => rej(new Error(`detector wall-clock ${perDetectorCap}ms`)),
+              perDetectorCap,
+            ),
+          ),
+        ]);
         const dt = Date.now() - t0;
         console.log(
           `     ⏱ ${name}: ${(dt / 1000).toFixed(1)}s · ${r.length} issue${r.length === 1 ? "" : "s"}`,
@@ -625,6 +640,12 @@ async function runVerifyPhase(outDir, browser, flags) {
         console.log(
           `     ⚠ ${name} threw after ${(dt / 1000).toFixed(1)}s: ${(e.message || "").slice(0, 80)}`,
         );
+        // If we hit the wall-clock cap, the page.evaluate is still running
+        // and the page is unresponsive. Skip remaining detectors — they'd
+        // hang too, and the cleanup needs to force-close anyway.
+        if (/detector wall-clock/.test(e.message || "")) {
+          pagePoisoned = true;
+        }
         return [];
       }
     };
@@ -678,8 +699,25 @@ async function runVerifyPhase(outDir, browser, flags) {
       origPage,
       clonePage,
       cleanup: async () => {
-        await context.close();
-        await cloneContext.close();
+        // Wall-clock-cap each close. If a detector triggered the wall-clock
+        // cap, its page.evaluate is still running and context.close() waits
+        // for it indefinitely. Bound the close at 5s and force-resolve.
+        const closeWithTimeout = async (c, label) => {
+          try {
+            await Promise.race([
+              c.close({ runBeforeUnload: false }),
+              new Promise((resolve) => setTimeout(resolve, 5000)),
+            ]);
+          } catch {}
+        };
+        try {
+          await origPage.close({ runBeforeUnload: false }).catch(() => {});
+        } catch {}
+        try {
+          await clonePage.close({ runBeforeUnload: false }).catch(() => {});
+        } catch {}
+        await closeWithTimeout(context, "origin");
+        await closeWithTimeout(cloneContext, "clone");
         server.kill();
       },
     };
@@ -6474,7 +6512,7 @@ async function main() {
       await context.storageState({ path: stateFile });
       console.log(`   💾 Auth state saved to ${stateFile}`);
       console.log(
-        `   Reuse with: node v23-stable.js ${TARGET} --auth ${stateFile}\n`,
+        `   Reuse with: node v54-stable.js ${TARGET} --auth ${stateFile}\n`,
       );
     }
     await loginPage.close();
@@ -8132,6 +8170,11 @@ function makeShipSlug(hostname) {
 
 async function shipToGit(outDir, repo) {
   const { execSync } = require("child_process");
+  // Defense-in-depth: validate `repo` against a strict allow-list before
+  // interpolating into shell commands. Format: <owner>/<name> with safe
+  // chars only. Prevents `--ship-name "foo;rm -rf ~"` style payloads.
+  if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(repo))
+    throw new Error(`unsafe repo name: ${repo}`);
   const run = (cmd, opts = {}) =>
     execSync(cmd, { cwd: outDir, encoding: "utf-8", ...opts }).trim();
   // Idempotent .gitignore — avoid pushing the cloner's diagnostic
@@ -8192,6 +8235,11 @@ async function shipToGit(outDir, repo) {
 
 async function shipToVercel(outDir, slug) {
   const { execSync } = require("child_process");
+  // Same allow-list as shipToGit's repo — Vercel project names are even more
+  // restrictive, but the underlying concern is preventing shell injection
+  // into the execSync below.
+  if (!/^[A-Za-z0-9._-]+$/.test(slug))
+    throw new Error(`unsafe project name: ${slug}`);
   // --scope=allonelabs targets the team; --prod is a production deploy;
   // --yes accepts the project-create prompt non-interactively; --name sets
   // the slug. Output ends with the deploy URL on stdout.
