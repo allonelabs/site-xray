@@ -682,10 +682,16 @@ async function enumeratePages(html, baseURL) {
     } catch {}
   }
 
-  // Filter non-HTML routes (sitemap files, feeds, asset extensions).
-  const SKIP_RE =
+  // Filter (1) non-HTML extensions and (2) backend / admin / API paths.
+  // The JSON walker can pick these up as if they were page routes —
+  // they aren't. Example: WP returns `_links: { wp:post_type: [...] }`
+  // where each entry has an `href: "https://site/wp-json/wp/v2/posts/N"`.
+  // We don't want to clone the JSON endpoint as if it were a page.
+  const SKIP_EXT =
     /\.(xml|json|rss|atom|txt|pdf|zip|tar|gz|jpg|jpeg|png|gif|webp|svg|ico|woff2?|ttf|otf|mp4|webm|mov|wav|mp3|map)(\?|$)/i;
-  return [...enumerated].filter((p) => !SKIP_RE.test(p));
+  const SKIP_PATH =
+    /^\/(?:api|rest|_api|_next\/data|_nuxt\/data|graphql|wp-admin|wp-json|wp-login|admin|dashboard|login|logout|signin|signout|signup|register|account)(?:\/|$|\?)/i;
+  return [...enumerated].filter((p) => !SKIP_EXT.test(p) && !SKIP_PATH.test(p));
 }
 
 async function main() {
