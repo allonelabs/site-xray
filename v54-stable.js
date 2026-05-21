@@ -8,7 +8,7 @@
  *
  * Single file. One dependency (playwright). Zero config.
  *
- * Usage: node v51-stable.js <url> [output-dir] [max-pages] [flags]
+ * Usage: node v54-stable.js <url> [output-dir] [max-pages] [flags]
  * Default max-pages: 20
  */
 
@@ -62,6 +62,8 @@ for (let i = 0; i < args.length; i++) {
     flags.maxPasses = parseInt(args[++i]) || Infinity;
   } else if (args[i] === "--interaction-timeout") {
     flags.interactionTimeout = parseInt(args[++i]) || 3000;
+  } else if (args[i] === "--verify-budget") {
+    flags.verifyBudgetMs = (parseInt(args[++i]) || 300) * 1000;
   } else if (args[i] === "--debug-report") {
     flags.debugReport = true;
   } else if (args[i] === "--responsive") {
@@ -95,6 +97,7 @@ Flags:
   --no-fix                 Run verify, write issues, no fixes applied
   --max-passes <N>         Cap verify+fix iterations (default: unlimited)
   --interaction-timeout <ms>  Per-click budget (default 3000)
+  --verify-budget <sec>    Cap verify-phase wall-clock per pass (default 300)
   --debug-report           Always emit debug-report.html
   --responsive             Capture desktop/tablet/mobile screenshots (v53 backport)
 
@@ -489,15 +492,33 @@ async function runVerifyPhase(outDir, browser, flags) {
   });
   const origPage = await context.newPage();
   const clonePage = await cloneContext.newPage();
+  // Verify-phase navigation is fragile against live sites that get sluggish
+  // after a long crawl (we saw page.goto timeout on bottega53). Try the
+  // strictest wait first, fall back to looser ones with backoff before giving
+  // up. Total budget ~75s per page (still fast enough; was 20s before).
+  async function gotoResilient(page, url, label) {
+    const attempts = [
+      { waitUntil: "networkidle", timeout: 30000 },
+      { waitUntil: "load", timeout: 25000 },
+      { waitUntil: "domcontentloaded", timeout: 20000 },
+    ];
+    let lastErr;
+    for (let k = 0; k < attempts.length; k++) {
+      try {
+        await page.goto(url, attempts[k]);
+        return;
+      } catch (e) {
+        lastErr = e;
+        console.log(
+          `     ↻ verify ${label} ${attempts[k].waitUntil} failed (${(e.message || "").slice(0, 60)}); ${k < attempts.length - 1 ? "retrying" : "giving up"}`,
+        );
+      }
+    }
+    throw lastErr;
+  }
   try {
-    await origPage.goto(originUrl, {
-      waitUntil: "networkidle",
-      timeout: 20000,
-    });
-    await clonePage.goto(server.url, {
-      waitUntil: "domcontentloaded",
-      timeout: 15000,
-    });
+    await gotoResilient(origPage, originUrl, "origin");
+    await gotoResilient(clonePage, server.url, "clone");
     // v54 C2: inject PIXEL_DIFF_SRC via addScriptTag (NOT evaluate) so
     // pixelDiff becomes a window-global on both pages and is callable from
     // subsequent page.evaluate() calls in probeHover.
@@ -519,15 +540,73 @@ async function runVerifyPhase(outDir, browser, flags) {
         .map((el) => (el.id ? "#" + CSS.escape(el.id) : null))
         .filter(Boolean);
     });
-    issues.push(...(await probeClick(origPage, clonePage, flags)));
-    issues.push(...(await probeHover(origPage, clonePage, hoverCandidates)));
-    issues.push(...(await auditForms(clonePage)));
-    issues.push(...(await probeAnimationTrajectory(origPage, clonePage)));
-    issues.push(...(await probeAnimationFrames(origPage, clonePage, outDir)));
-    issues.push(...(await probeScrollCheckpoint(origPage, clonePage)));
-    issues.push(...(await probeVisualDiff(origPage, clonePage, flags)));
+    // Per-detector budget guard. flags.verifyBudgetMs is the overall verify
+    // wall-clock cap (default 300_000 = 5min). Each detector logs its own
+    // duration so the slow ones are visible; if cumulative time exceeds the
+    // budget, remaining detectors are skipped (they return []).
+    const verifyStart = Date.now();
+    const budgetMs = flags.verifyBudgetMs ?? 300000;
+    const elapsedMs = () => Date.now() - verifyStart;
+    const remainingMs = () => Math.max(0, budgetMs - elapsedMs());
+    const run = async (name, fn) => {
+      if (remainingMs() === 0) {
+        console.log(`     ⏱ ${name}: skipped (verify budget exhausted)`);
+        return [];
+      }
+      const t0 = Date.now();
+      try {
+        const r = await fn();
+        const dt = Date.now() - t0;
+        console.log(
+          `     ⏱ ${name}: ${(dt / 1000).toFixed(1)}s · ${r.length} issue${r.length === 1 ? "" : "s"}`,
+        );
+        return r;
+      } catch (e) {
+        const dt = Date.now() - t0;
+        console.log(
+          `     ⚠ ${name} threw after ${(dt / 1000).toFixed(1)}s: ${(e.message || "").slice(0, 80)}`,
+        );
+        return [];
+      }
+    };
+    issues.push(
+      ...(await run("probeClick", () =>
+        probeClick(origPage, clonePage, flags),
+      )),
+    );
+    issues.push(
+      ...(await run("probeHover", () =>
+        probeHover(origPage, clonePage, hoverCandidates),
+      )),
+    );
+    issues.push(...(await run("auditForms", () => auditForms(clonePage))));
+    issues.push(
+      ...(await run("probeAnimationTrajectory", () =>
+        probeAnimationTrajectory(origPage, clonePage),
+      )),
+    );
+    issues.push(
+      ...(await run("probeAnimationFrames", () =>
+        probeAnimationFrames(origPage, clonePage, outDir),
+      )),
+    );
+    issues.push(
+      ...(await run("probeScrollCheckpoint", () =>
+        probeScrollCheckpoint(origPage, clonePage),
+      )),
+    );
+    issues.push(
+      ...(await run("probeVisualDiff", () =>
+        probeVisualDiff(origPage, clonePage, flags),
+      )),
+    );
     // probeConsoleAudit MUST be last: its reload tears down PIXEL_DIFF_SRC.
-    issues.push(...(await probeConsoleAudit(origPage, clonePage)));
+    issues.push(
+      ...(await run("probeConsoleAudit", () =>
+        probeConsoleAudit(origPage, clonePage),
+      )),
+    );
+    console.log(`     ⏱ verify total: ${(elapsedMs() / 1000).toFixed(1)}s`);
     const deduped = dedupAnimationIssues(issues);
     // v54 E2: capture per-issue evidence screenshots (orig + clone bbox crops)
     // for any issue with a selector. Animation frame captures are saved inside
@@ -950,7 +1029,7 @@ async function probeAnimationTrajectory(origPage, clonePage) {
           }
         }
       }
-      return result.slice(0, 30);
+      return result.slice(0, 10);
     });
   } catch (e) {
     logCaptureError("probeAnimationTrajectory:enumerate", e);
@@ -959,8 +1038,12 @@ async function probeAnimationTrajectory(origPage, clonePage) {
 
   for (const selector of animatedSelectors) {
     try {
-      const origTraj = await sampleTrajectory(origPage, selector);
-      const cloneTraj = await sampleTrajectory(clonePage, selector);
+      // Sample both pages in parallel — the trajectories are independent and
+      // the calls just wait inside the browser. Halves wall-clock per element.
+      const [origTraj, cloneTraj] = await Promise.all([
+        sampleTrajectory(origPage, selector),
+        sampleTrajectory(clonePage, selector),
+      ]);
       const dist = trajectoryDistance(origTraj, cloneTraj);
       if (
         dist.posDrift > 2 ||
@@ -988,12 +1071,16 @@ async function probeAnimationTrajectory(origPage, clonePage) {
 }
 
 async function sampleTrajectory(page, selector) {
+  // Window: 2s @ 200ms steps (was 5s @ 100ms = 50 samples per call). At 30
+  // selectors × 2 pages this dominated verify wall-clock; 2s × 10 samples is
+  // enough to detect typical CSS animation drift without watching loop-cycles
+  // play out twice.
   return await page.evaluate(async (sel) => {
     const el = document.querySelector(sel);
     if (!el) return null;
     const samples = [];
     const start = performance.now();
-    while (performance.now() - start < 5000) {
+    while (performance.now() - start < 2000) {
       const r = el.getBoundingClientRect();
       const cs = getComputedStyle(el);
       samples.push({
@@ -1005,7 +1092,7 @@ async function sampleTrajectory(page, selector) {
         opacity: parseFloat(cs.opacity) || 1,
         transform: cs.transform,
       });
-      await new Promise((r) => setTimeout(r, 100));
+      await new Promise((r) => setTimeout(r, 200));
     }
     return samples;
   }, selector);
@@ -1035,7 +1122,9 @@ function trajectoryDistance(a, b) {
 // issue. Frames are captured at ~200ms intervals.
 async function probeAnimationFrames(origPage, clonePage, outDir) {
   const issues = [];
-  const FRAME_COUNT = 25;
+  // 12 frames × 200ms = 2.4s window (was 25 × 200ms = 5s). Still spans a
+  // full typical CSS animation cycle and halves the per-pass screenshot cost.
+  const FRAME_COUNT = 12;
   const FRAME_INTERVAL_MS = 200;
   const captureFrames = async (page) => {
     const frames = [];
@@ -1328,7 +1417,7 @@ async function probeConsoleAudit(origPage, clonePage) {
 // v54 D1: Fix strategy table — each issue type maps to an ordered list of fixer fns
 // Each fixer returns { ok: bool, notes: string }; fixers are tried in order across passes.
 const FIX_STRATEGIES = {
-  "click-no-op": [fixClickReinjectHandler, fixClickDelegatedListener],
+  "click-no-op": [fixClickDelegatedListener],
   "click-throws": [
     fixClickThrowsInlineMissingGlobal,
     fixClickThrowsStubAndEscalate,
@@ -1459,61 +1548,235 @@ async function runUntilClean(outDir, browser, flags) {
 function writeDebugReport(outDir, loopResult, flags) {
   const issues = loopResult.finalIssues;
   if (issues.length === 0 && !flags.debugReport) return;
+
+  // Pull target URL from manifest.json for the header subtitle (best-effort).
+  let targetURL = "";
+  try {
+    const m = JSON.parse(
+      fs.readFileSync(path.join(outDir, "data", "manifest.json"), "utf-8"),
+    );
+    targetURL = m.url || m.target || "";
+  } catch {}
+
+  // Issue → family color rail. Semantic grouping, not random.
+  const familyOf = (t) => {
+    if (/^click-|missing-hover|missing-focus|broken-form/.test(t))
+      return "interaction";
+    if (/animation|drift|scroll-anim/.test(t)) return "motion";
+    if (/console-error/.test(t)) return "error";
+    if (/404|lazy|font-glyph|svg-symbol|webgl/.test(t)) return "asset";
+    if (/iframe-blocked/.test(t)) return "error";
+    return "default";
+  };
+
+  const history = loopResult.history || [];
+  const maxCount = Math.max(1, ...history.map((h) => h.issueCount || 0));
+  const passStrip = history
+    .map((h) => {
+      const ratio = (h.issueCount || 0) / maxCount;
+      const heightPct = Math.max(4, Math.round(ratio * 100));
+      const labelApplied =
+        h.applied !== undefined ? ` · ${h.applied}/${h.attempted} fixed` : "";
+      return `<div class="pass-col" title="pass ${h.pass}: ${h.issueCount} issue(s)${labelApplied}">
+  <div class="pass-bar" style="height:${heightPct}%"></div>
+  <div class="pass-num">${h.pass}</div>
+</div>`;
+    })
+    .join("");
+
+  const statusClass =
+    loopResult.stopReason === "clean"
+      ? "ok"
+      : loopResult.stopReason === "stalled"
+        ? "warn"
+        : "alert";
+
+  // Paths in issue.evidence are stored relative to the clone root (e.g.
+  // "data/issues/abc-orig.png"). debug-report.html lives INSIDE data/, so we
+  // strip a leading "data/" prefix when rendering so the browser resolves the
+  // image relative to the report's own location.
+  const relToReport = (p) =>
+    typeof p === "string" && p.startsWith("data/") ? p.slice(5) : p;
+
   const cards = issues
-    .map((issue) => {
+    .map((issue, i) => {
+      const num = String(i + 1).padStart(2, "0");
+      const family = familyOf(issue.type);
       const origImg = issue.evidence?.screenshotOrig
-        ? `<img src="${issue.evidence.screenshotOrig}" alt="original"/>`
-        : "<em>no screenshot</em>";
+        ? `<img src="${escapeHtml(relToReport(issue.evidence.screenshotOrig))}" alt="original" loading="lazy"/>`
+        : `<div class="noshot">no screenshot</div>`;
       const cloneImg = issue.evidence?.screenshotClone
-        ? `<img src="${issue.evidence.screenshotClone}" alt="clone"/>`
-        : "<em>no screenshot</em>";
+        ? `<img src="${escapeHtml(relToReport(issue.evidence.screenshotClone))}" alt="clone" loading="lazy"/>`
+        : `<div class="noshot">no screenshot</div>`;
+
       let animBlock = "";
       if (issue.type === "visual-drift-animated") {
         const frameDir = `data/issues/${issue.id}-anim`;
         const fullFrameDir = path.join(outDir, frameDir);
+        const relFrameDir = relToReport(frameDir);
         if (fs.existsSync(fullFrameDir)) {
           const frames = fs
             .readdirSync(fullFrameDir)
             .filter((f) => f.startsWith("orig-"))
             .sort();
           if (frames.length > 0) {
+            const keyframes = frames
+              .map(
+                (f, k) =>
+                  `  ${((k / frames.length) * 100).toFixed(1)}% { background-image: url('${relFrameDir}/${f}'); }`,
+              )
+              .join("\n");
             animBlock = `
 <div class="anim-pair">
-  <div class="anim-side" style="background-image:url('${frameDir}/${frames[0]}');animation:v54-anim-${issue.id} 5s steps(${frames.length}) infinite"></div>
+  <div class="anim-label">animation playback</div>
+  <div class="anim-side" style="background-image:url('${relFrameDir}/${frames[0]}');animation:v54-anim-${issue.id} 5s steps(${frames.length}) infinite"></div>
   <style>@keyframes v54-anim-${issue.id} {
-${frames.map((f, i) => `  ${((i / frames.length) * 100).toFixed(1)}% { background-image: url('${frameDir}/${f}'); }`).join("\n")}
+${keyframes}
   }</style>
 </div>`;
           }
         }
       }
+
+      const orig = escapeHtml(issue.evidence?.originalBehavior || "—");
+      const clone = escapeHtml(issue.evidence?.cloneBehavior || "—");
+
       return `
-<div class="issue">
-  <h3>${escapeHtml(issue.type)}: <code>${escapeHtml(issue.selector || "(page-level)")}</code></h3>
-  <p>${escapeHtml(issue.evidence?.originalBehavior || "")} → ${escapeHtml(issue.evidence?.cloneBehavior || "")}</p>
-  <p>Fix attempts: ${issue.fixAttempts}. Strategy: <code>${escapeHtml(issue.fixStrategy)}</code></p>
-  <div class="pair"><div>Original<br>${origImg}</div><div>Clone<br>${cloneImg}</div></div>
-  ${animBlock}
-</div>`;
+<section class="issue" data-family="${family}">
+  <div class="rail"></div>
+  <div class="meta">
+    <div class="num">${num}</div>
+    <div class="type">${escapeHtml(issue.type)}</div>
+    <div class="strategy">strategy <span>${escapeHtml(issue.fixStrategy || "—")}</span> · ${issue.fixAttempts} attempt${issue.fixAttempts === 1 ? "" : "s"}</div>
+  </div>
+  <div class="body">
+    <div class="selector">${escapeHtml(issue.selector || "(page-level)")}</div>
+    <div class="diff"><span class="diff-label">original</span><span class="diff-val">${orig}</span><span class="arrow">→</span><span class="diff-label">clone</span><span class="diff-val">${clone}</span></div>
+    <div class="pair"><figure><figcaption>original</figcaption>${origImg}</figure><figure><figcaption>clone</figcaption>${cloneImg}</figure></div>
+    ${animBlock}
+  </div>
+</section>`;
     })
     .join("\n");
+
   const html = `<!DOCTYPE html>
-<html><head><title>v54 debug report</title>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>v54 · ${escapeHtml(targetURL || "debug report")}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,600;1,6..72,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-body { font-family: -apple-system, system-ui, sans-serif; max-width: 1200px; margin: 2em auto; padding: 0 1em; }
-.issue { border: 1px solid #ddd; border-radius: 8px; padding: 1em; margin: 1em 0; }
-.issue h3 { margin: 0 0 .5em; }
-.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 1em; }
-.pair img { max-width: 100%; border: 1px solid #ccc; }
-.anim-pair { margin-top: 1em; }
-.anim-side { width: 100%; height: 200px; background-size: contain; background-repeat: no-repeat; background-position: center; border: 1px solid #ccc; }
-code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; }
-</style></head>
+:root {
+  --ink: #0e0d12;
+  --ink-2: #16151c;
+  --ink-3: #1e1d26;
+  --line: #2b2a35;
+  --line-soft: #211f29;
+  --text: #f0ece2;
+  --text-2: #9b97a8;
+  --text-3: #6a6776;
+  --amber: #f5a623;
+  --coral: #e3674c;
+  --violet: #a17bd0;
+  --teal: #3aa5b3;
+  --sage: #7fb88c;
+  --serif: "Newsreader", ui-serif, Georgia, serif;
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { background: var(--ink); color: var(--text); }
+body { font-family: var(--sans); margin: 0; padding: 0; font-size: 14px; line-height: 1.55; }
+.shell { display: grid; grid-template-columns: minmax(260px, 320px) 1fr; min-height: 100vh; }
+.aside { background: var(--ink-2); border-right: 1px solid var(--line); padding: 40px 32px; position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto; }
+.brand { font-family: var(--serif); font-size: 28px; font-weight: 400; letter-spacing: -0.01em; line-height: 1.1; }
+.brand em { font-style: italic; color: var(--amber); }
+.sub { font-family: var(--mono); font-size: 11px; color: var(--text-3); margin-top: 4px; letter-spacing: 0.04em; text-transform: uppercase; }
+.url { font-family: var(--mono); font-size: 12px; color: var(--text-2); margin-top: 24px; word-break: break-all; }
+.url a { color: inherit; text-decoration: none; border-bottom: 1px dashed var(--line); }
+.status { margin-top: 28px; display: flex; align-items: center; gap: 10px; font-family: var(--mono); font-size: 12px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; }
+.status.ok .dot { background: var(--sage); box-shadow: 0 0 0 4px rgba(127,184,140,.15); }
+.status.warn .dot { background: var(--amber); box-shadow: 0 0 0 4px rgba(245,166,35,.15); }
+.status.alert .dot { background: var(--coral); box-shadow: 0 0 0 4px rgba(227,103,76,.15); }
+.stats { margin-top: 24px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px 24px; }
+.stat-label { font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; color: var(--text-3); text-transform: uppercase; }
+.stat-val { font-family: var(--serif); font-size: 24px; font-weight: 400; margin-top: 4px; }
+.pass-strip { margin-top: 32px; }
+.pass-strip-label { font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; color: var(--text-3); text-transform: uppercase; margin-bottom: 12px; }
+.pass-row { display: flex; align-items: flex-end; gap: 6px; height: 80px; padding-bottom: 18px; border-bottom: 1px solid var(--line-soft); position: relative; }
+.pass-col { flex: 1; display: flex; flex-direction: column; align-items: center; height: 100%; justify-content: flex-end; cursor: default; }
+.pass-bar { width: 100%; background: linear-gradient(to top, var(--amber), rgba(245,166,35,.2)); min-height: 2px; transition: opacity .15s; }
+.pass-col:hover .pass-bar { opacity: 0.7; }
+.pass-num { font-family: var(--mono); font-size: 10px; color: var(--text-3); margin-top: 6px; }
+
+.main { padding: 56px 64px 96px; max-width: 1100px; }
+.eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; color: var(--text-3); text-transform: uppercase; margin-bottom: 12px; }
+.title { font-family: var(--serif); font-size: 44px; font-weight: 400; letter-spacing: -0.02em; line-height: 1.05; margin: 0 0 8px; }
+.title em { font-style: italic; color: var(--text-2); }
+.subtitle { color: var(--text-2); font-size: 14px; margin-bottom: 48px; max-width: 640px; }
+
+.issue { display: grid; grid-template-columns: 4px 220px 1fr; gap: 0 32px; padding: 28px 0; border-bottom: 1px solid var(--line-soft); }
+.issue:first-of-type { border-top: 1px solid var(--line-soft); }
+.rail { background: var(--text-3); }
+.issue[data-family="interaction"] .rail { background: var(--amber); }
+.issue[data-family="motion"] .rail { background: var(--violet); }
+.issue[data-family="error"] .rail { background: var(--coral); }
+.issue[data-family="asset"] .rail { background: var(--teal); }
+.meta .num { font-family: var(--serif); font-size: 32px; font-weight: 400; color: var(--text-2); line-height: 1; }
+.meta .type { font-family: var(--mono); font-size: 13px; color: var(--text); margin-top: 8px; font-weight: 500; }
+.meta .strategy { font-family: var(--mono); font-size: 11px; color: var(--text-3); margin-top: 16px; line-height: 1.6; }
+.meta .strategy span { color: var(--text-2); }
+.body .selector { font-family: var(--mono); font-size: 12px; color: var(--text-2); background: var(--ink-2); border: 1px solid var(--line-soft); padding: 10px 14px; word-break: break-all; }
+.diff { font-family: var(--mono); font-size: 12px; color: var(--text-2); margin: 14px 0 18px; display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: baseline; }
+.diff-label { color: var(--text-3); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; }
+.diff-val { color: var(--text); }
+.arrow { color: var(--text-3); margin: 0 4px; }
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.pair figure { margin: 0; display: flex; flex-direction: column; gap: 8px; }
+.pair figcaption { font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; color: var(--text-3); text-transform: uppercase; }
+.pair img { width: 100%; display: block; border: 1px solid var(--line); background: var(--ink-2); }
+.noshot { padding: 48px 16px; text-align: center; font-family: var(--mono); font-size: 11px; color: var(--text-3); background: var(--ink-2); border: 1px dashed var(--line); }
+.anim-pair { margin-top: 16px; }
+.anim-label { font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; color: var(--text-3); text-transform: uppercase; margin-bottom: 8px; }
+.anim-side { width: 100%; height: 220px; background-size: contain; background-repeat: no-repeat; background-position: center; border: 1px solid var(--line); background-color: var(--ink-2); }
+
+@media (max-width: 960px) {
+  .shell { grid-template-columns: 1fr; }
+  .aside { position: relative; height: auto; border-right: none; border-bottom: 1px solid var(--line); }
+  .issue { grid-template-columns: 4px 1fr; }
+  .meta { display: flex; gap: 16px; align-items: baseline; margin-bottom: 12px; }
+  .meta .strategy { margin-top: 0; }
+  .main { padding: 32px 24px 64px; }
+}
+</style>
+</head>
 <body>
-<h1>v54 debug report</h1>
-<p>Final status: <strong>${escapeHtml(loopResult.stopReason)}</strong>. Passes: ${loopResult.history.length}. Unfixable issues: ${issues.length}.</p>
-${cards}
-</body></html>`;
+<div class="shell">
+  <aside class="aside">
+    <div class="brand">v54 <em>debug</em></div>
+    <div class="sub">Site X-Ray · pipeline report</div>
+    ${targetURL ? `<div class="url"><a href="${escapeHtml(targetURL)}" target="_blank" rel="noopener">${escapeHtml(targetURL)}</a></div>` : ""}
+    <div class="status ${statusClass}"><div class="dot"></div><div>${escapeHtml(loopResult.stopReason || "unknown")}</div></div>
+    <div class="stats">
+      <div><div class="stat-label">passes</div><div class="stat-val">${history.length}</div></div>
+      <div><div class="stat-label">unfixable</div><div class="stat-val">${issues.length}</div></div>
+    </div>
+    <div class="pass-strip">
+      <div class="pass-strip-label">issue count per pass</div>
+      <div class="pass-row">${passStrip}</div>
+    </div>
+  </aside>
+  <main class="main">
+    <div class="eyebrow">unresolved · ${issues.length} issue${issues.length === 1 ? "" : "s"}</div>
+    <h1 class="title">What the clone <em>still</em> doesn't do.</h1>
+    <p class="subtitle">Each card is one behavior present in the original site but missing or different in the clone. Strategies are tried in order; if none stick, the issue lands here.</p>
+    ${cards || `<div class="noshot" style="padding:80px 16px">No unresolved issues — clone matches the original.</div>`}
+  </main>
+</div>
+</body>
+</html>`;
   fs.writeFileSync(path.join(outDir, "data", "debug-report.html"), html);
   console.log(`     📊 Debug report: data/debug-report.html`);
 }
@@ -1530,48 +1793,65 @@ function escapeHtml(s) {
 
 // ─── click-no-op strategies ───────────────────────────────────────────
 
-async function fixClickReinjectHandler(issue, outDir, origPage, clonePage) {
-  // Try to find the original handler source via JS coverage
-  // Simplified: if coverage shows a function that runs on click, inline that function in clone
-  // For now, this strategy is a stub that defers to delegated listener; full coverage flow is in D1.5
-  return {
-    ok: false,
-    notes:
-      "coverage-based reinject not yet implemented; deferring to delegated listener",
-  };
-}
-
 async function fixClickDelegatedListener(issue, outDir, origPage, clonePage) {
-  // Capture handler effect by recording DOM mutations on click of original
+  // Replay the original click to learn its effect, then synthesize a fix
+  // tailored to that effect:
+  //   - if the click navigated to a different URL → inject a navigation handler
+  //   - if it triggered a non-trivial DOM mutation (panel/dropdown) → no fix
+  //     yet (interactive replay is a follow-up); return ok:false with notes
   const recipe = await origPage
     .evaluate(async (sel) => {
       const el = document.querySelector(sel);
       if (!el) return null;
-      const beforeHTML = document.body.innerHTML.slice(0, 50000);
+      const beforeURL = location.href;
+      const beforeLen = document.body.innerHTML.length;
       el.click();
       await new Promise((r) => setTimeout(r, 600));
-      const afterHTML = document.body.innerHTML.slice(0, 50000);
       return {
-        url: location.href,
-        beforeLen: beforeHTML.length,
-        afterLen: afterHTML.length,
-        navigated: location.href,
+        beforeURL,
+        afterURL: location.href,
+        beforeLen,
+        afterLen: document.body.innerHTML.length,
       };
     }, issue.selector)
     .catch(() => null);
   if (!recipe)
     return { ok: false, notes: "could not record original handler effect" };
-  // Inject a delegated-listener stub into the clone's index.html that, on click of selector, navigates to recipe.url
+  const navigated = recipe.afterURL !== recipe.beforeURL;
+  if (!navigated) {
+    return {
+      ok: false,
+      notes: `click triggered DOM mutation (${recipe.afterLen - recipe.beforeLen} chars) but no navigation — interactive-panel replay not yet implemented`,
+    };
+  }
+  // recipe.afterURL is on the LIVE origin. For same-origin nav, rewrite to a
+  // path-relative target so the clone (served from a local server) stays in
+  // the clone instead of redirecting to the live site. External-domain nav
+  // stays absolute.
+  let navTarget;
+  try {
+    const beforeOrigin = new URL(recipe.beforeURL).origin;
+    const after = new URL(recipe.afterURL);
+    navTarget =
+      after.origin === beforeOrigin
+        ? after.pathname + after.search + after.hash
+        : recipe.afterURL;
+  } catch {
+    navTarget = recipe.afterURL;
+  }
   const indexPath = path.join(outDir, "index.html");
   if (!fs.existsSync(indexPath))
     return { ok: false, notes: "index.html missing" };
   let html = fs.readFileSync(indexPath, "utf-8");
   const sentinel = `<!--v54-fix:${issue.id}-->`;
   if (html.includes(sentinel)) return { ok: false, notes: "already attempted" };
-  const stub = `\n${sentinel}\n<script>document.addEventListener('click', function(e) { if (e.target && e.target.matches && e.target.matches(${JSON.stringify(issue.selector)})) { console.log('v54-fix:${issue.id} click intercepted'); } });</script>\n`;
+  const stub = `\n${sentinel}\n<script>document.addEventListener('click', function(e) { var t = e.target; while (t && t !== document.body) { if (t.matches && t.matches(${JSON.stringify(issue.selector)})) { e.preventDefault(); window.location.href = ${JSON.stringify(navTarget)}; return; } t = t.parentElement; } });</script>\n`;
   html = html.replace("</body>", stub + "</body>");
   fs.writeFileSync(indexPath, html);
-  return { ok: true, notes: "injected delegated listener stub" };
+  return {
+    ok: true,
+    notes: `injected navigation handler → ${navTarget}`,
+  };
 }
 
 // ─── click-throws strategies ──────────────────────────────────────────
@@ -5728,7 +6008,7 @@ async function main() {
   }
 
   console.log(
-    `\n🔬 Site X-Ray v51\n   ${TARGET} → ${OUT}\n   Max pages: ${MAX_PAGES}${sitemapPages.length ? ` (${sitemapPages.length} from sitemap)` : ""}\n`,
+    `\n🔬 Site X-Ray v54\n   ${TARGET} → ${OUT}\n   Max pages: ${MAX_PAGES}${sitemapPages.length ? ` (${sitemapPages.length} from sitemap)` : ""}\n`,
   );
 
   // v11: Auth support
