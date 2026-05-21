@@ -522,6 +522,7 @@ async function runVerifyPhase(outDir, browser, flags) {
     issues.push(...(await probeClick(origPage, clonePage, flags)));
     issues.push(...(await probeHover(origPage, clonePage, hoverCandidates)));
     issues.push(...(await auditForms(clonePage)));
+    issues.push(...(await probeAnimationTrajectory(origPage, clonePage)));
     return {
       issues,
       origPage,
@@ -895,6 +896,125 @@ async function auditForms(clonePage) {
     }
   }
   return issues;
+}
+
+// v54 C3: Animation diff — sample bounding-rect + computed style every 100ms
+// for 5s on both pages, then compare trajectories.  An animated element on
+// the original whose clone counterpart is static will show position /
+// opacity / transform drift over the sampling window.
+async function probeAnimationTrajectory(origPage, clonePage) {
+  const issues = [];
+  // Enumerate animated elements on the original page.
+  let animatedSelectors = [];
+  try {
+    animatedSelectors = await origPage.evaluate(() => {
+      const all = Array.from(document.querySelectorAll("*"));
+      const result = [];
+      for (const el of all) {
+        const cs = getComputedStyle(el);
+        const hasAnim =
+          el.getAnimations({ subtree: false }).length > 0 ||
+          parseFloat(cs.transitionDuration) > 0 ||
+          parseFloat(cs.animationDuration) > 0;
+        if (hasAnim) {
+          const r = el.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) {
+            if (el.id) {
+              result.push("#" + CSS.escape(el.id));
+            } else if (el.className && typeof el.className === "string") {
+              const cls = el.className
+                .split(/\s+/)
+                .filter((c) => c)
+                .slice(0, 2);
+              if (cls.length) {
+                const sel =
+                  el.tagName.toLowerCase() +
+                  "." +
+                  cls.map((c) => CSS.escape(c)).join(".");
+                if (document.querySelectorAll(sel).length === 1)
+                  result.push(sel);
+              }
+            }
+          }
+        }
+      }
+      return result.slice(0, 30);
+    });
+  } catch (e) {
+    logCaptureError("probeAnimationTrajectory:enumerate", e);
+    return issues;
+  }
+
+  for (const selector of animatedSelectors) {
+    try {
+      const origTraj = await sampleTrajectory(origPage, selector);
+      const cloneTraj = await sampleTrajectory(clonePage, selector);
+      const dist = trajectoryDistance(origTraj, cloneTraj);
+      if (
+        dist.posDrift > 2 ||
+        dist.opacityDrift > 0.05 ||
+        dist.transformDrift > 0.1
+      ) {
+        issues.push({
+          id: issueId("missing-animation", selector, null),
+          type: "missing-animation",
+          selector,
+          evidence: {
+            originalBehavior: `animated (pos drift ${dist.posDrift.toFixed(1)}px, opacity drift ${dist.opacityDrift.toFixed(2)})`,
+            cloneBehavior: "static",
+          },
+          fixStrategy: "missing-animation",
+          fixAttempts: 0,
+          resolvedInPass: null,
+        });
+      }
+    } catch (e) {
+      logCaptureError(`probeAnimationTrajectory:${selector}`, e);
+    }
+  }
+  return issues;
+}
+
+async function sampleTrajectory(page, selector) {
+  return await page.evaluate(async (sel) => {
+    const el = document.querySelector(sel);
+    if (!el) return null;
+    const samples = [];
+    const start = performance.now();
+    while (performance.now() - start < 5000) {
+      const r = el.getBoundingClientRect();
+      const cs = getComputedStyle(el);
+      samples.push({
+        t: performance.now() - start,
+        x: r.x,
+        y: r.y,
+        w: r.width,
+        h: r.height,
+        opacity: parseFloat(cs.opacity) || 1,
+        transform: cs.transform,
+      });
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return samples;
+  }, selector);
+}
+
+function trajectoryDistance(a, b) {
+  if (!a || !b) return { posDrift: 0, opacityDrift: 0, transformDrift: 0 };
+  const n = Math.min(a.length, b.length);
+  let posDrift = 0,
+    opacityDrift = 0,
+    transformDrift = 0;
+  for (let i = 0; i < n; i++) {
+    posDrift = Math.max(posDrift, Math.hypot(a[i].x - b[i].x, a[i].y - b[i].y));
+    opacityDrift = Math.max(
+      opacityDrift,
+      Math.abs(a[i].opacity - b[i].opacity),
+    );
+    if (a[i].transform !== b[i].transform)
+      transformDrift = Math.max(transformDrift, 0.5);
+  }
+  return { posDrift, opacityDrift, transformDrift };
 }
 
 function pathToFile(p) {

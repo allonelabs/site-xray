@@ -91,3 +91,21 @@ test(
     });
   },
 );
+
+test(
+  "v54 C3: probeAnimationTrajectory detects missing CSS animation on broken clone",
+  { timeout: 90000 },
+  async () => {
+    const brokenDir = path.join(FIXTURES, "missing-animation-broken");
+    const sidecarUrl = `http://localhost:${SIDECAR_PORT}/missing-animation.html`;
+    await withSidecar(async () => {
+      const res = runVerifyOnly(brokenDir, sidecarUrl);
+      const out = (res.stdout || "") + (res.stderr || "");
+      assert.match(
+        out,
+        /missing-animation/,
+        `expected missing-animation in output; got:\n${out}`,
+      );
+    });
+  },
+);
