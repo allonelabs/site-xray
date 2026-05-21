@@ -56,6 +56,8 @@ for (let i = 0; i < args.length; i++) {
     flags.noVerify = true;
   } else if (args[i] === "--verify-only") {
     flags.verifyOnly = args[++i];
+  } else if (args[i] === "--no-capture-api") {
+    flags.captureAPI = false;
   } else if (args[i] === "--no-fix") {
     flags.noFix = true;
   } else if (args[i] === "--max-passes") {
@@ -116,6 +118,9 @@ Flags:
   --verify-budget <sec>    Cap verify-phase wall-clock per pass (default 300)
   --concurrency <N>        Crawl up to N pages in parallel (default 1, max 8)
   --debug-report           Always emit debug-report.html
+  --no-capture-api         Skip XHR/fetch capture (default: on; recordings →
+                           data/api-recordings.json + data/api/*.json,
+                           vercel.json rewrites generated for replay)
   --responsive             Capture desktop/tablet/mobile screenshots (v53 backport)
 
 # Ship
@@ -159,6 +164,18 @@ const ALT_DOMAIN = (() => {
 const urlMap = {};
 const networkURLs = new Set();
 const MAX_NETWORK_URLS = 5000; // v53 backport: cap to prevent unbounded memory
+
+// v55 P2: API recording state. Populated by captureAPIResponse() during the
+// clone phase. Each entry is one XHR/fetch response we observed Playwright
+// receiving. At end of clone we:
+//   1. Write data/api-recordings.json (manifest)
+//   2. Add each entry to urlMap so JS bundle URL-rewriting points at the local
+//      copy instead of the live API
+//   3. Emit vercel.json rewrites so deployed clones serve the saved bodies
+const apiRecordings = [];
+const apiRecordedURLs = new Set(); // dedupe by url+method+postData hash
+const MAX_API_RECORDINGS = 2000;
+const MAX_API_BODY_BYTES = 5 * 1024 * 1024; // 5MB per response — skip huge ones
 // v53 backport: Error capture for silent failure diagnostics
 const captureErrors = [];
 function logCaptureError(context, error) {
@@ -168,6 +185,86 @@ function logCaptureError(context, error) {
     error: msg.slice(0, 200),
     timestamp: new Date().toISOString(),
   });
+}
+
+// v55 P2: capture a Playwright response if it looks like an API call.
+// Anti-patterns we deliberately skip:
+//   - resourceType document/stylesheet/image/font/media (already covered by
+//     asset download in capturePage)
+//   - analytics / tracking (poison the recordings with PII + cookies)
+//   - error responses (4xx/5xx — not useful to replay)
+//   - bodies > 5MB (likely streaming endpoints; saving them bloats the clone)
+//   - bodies that are HTML (Next.js _next/data prerender JSON IS useful, but
+//     a redirected document load isn't; resourceType filters it)
+const ANALYTICS_RE =
+  /googletagmanager|google-analytics|googleads|doubleclick|facebook\.net|fbq|hotjar|segment|mixpanel|amplitude|posthog|datadog|sentry|fullstory|cookiebot|onetrust|clarity\.ms|stats\.g\.doubleclick|adsystem/i;
+async function captureAPIResponse(res, outDir) {
+  try {
+    if (apiRecordings.length >= MAX_API_RECORDINGS) return;
+    const req = res.request();
+    const rt = req.resourceType();
+    if (!["xhr", "fetch", "eventsource", "manifest"].includes(rt)) return;
+    const url = res.url();
+    if (ANALYTICS_RE.test(url)) return;
+    const status = res.status();
+    if (status >= 400 || status < 200) return;
+    const method = req.method();
+    const postData = req.postData() || "";
+    const dedupKey = `${method}|${url}|${postData.slice(0, 1024)}`;
+    if (apiRecordedURLs.has(dedupKey)) return;
+    apiRecordedURLs.add(dedupKey);
+    let body;
+    try {
+      body = await res.body();
+    } catch {
+      return;
+    }
+    if (!body || body.length === 0 || body.length > MAX_API_BODY_BYTES) return;
+    const hash = crypto
+      .createHash("md5")
+      .update(dedupKey)
+      .digest("hex")
+      .slice(0, 10);
+    const ext = (res.headers()["content-type"] || "").includes("json")
+      ? ".json"
+      : (res.headers()["content-type"] || "").includes("xml")
+        ? ".xml"
+        : ".bin";
+    const savedPath = path.posix.join("data", "api", `${hash}${ext}`);
+    const fullPath = path.join(outDir, savedPath);
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+    fs.writeFileSync(fullPath, body);
+    apiRecordings.push({
+      url,
+      method,
+      status,
+      contentType: res.headers()["content-type"] || "",
+      requestBody: postData.length > 0 ? postData.slice(0, 4096) : null,
+      requestHeaders: filterRequestHeaders(req.headers()),
+      savedPath: "/" + savedPath,
+      bytes: body.length,
+      capturedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    logCaptureError("captureAPIResponse", e);
+  }
+}
+function filterRequestHeaders(h) {
+  // Keep generic headers, drop cookies / auth — clones shouldn't ship those.
+  const out = {};
+  for (const [k, v] of Object.entries(h || {})) {
+    const lk = k.toLowerCase();
+    if (
+      lk === "cookie" ||
+      lk === "authorization" ||
+      lk.startsWith("x-csrf") ||
+      lk.startsWith("x-xsrf")
+    )
+      continue;
+    if (lk === "accept" || lk === "content-type" || lk === "accept-language")
+      out[k] = v;
+  }
+  return out;
 }
 const crawled = new Set();
 const queue = [PARSED.pathname || "/"];
@@ -6765,6 +6862,7 @@ async function main() {
     try {
       if (res.status() === 200 && networkURLs.size < MAX_NETWORK_URLS)
         networkURLs.add(res.url());
+      if (flags.captureAPI !== false) await captureAPIResponse(res, OUT);
     } catch (e) {}
   });
 
@@ -6806,6 +6904,7 @@ async function main() {
           try {
             if (res.status() === 200 && networkURLs.size < MAX_NETWORK_URLS)
               networkURLs.add(res.url());
+            if (flags.captureAPI !== false) await captureAPIResponse(res, OUT);
           } catch (e) {}
         });
         n++;
@@ -6823,6 +6922,7 @@ async function main() {
       try {
         if (res.status() === 200 && networkURLs.size < MAX_NETWORK_URLS)
           networkURLs.add(res.url());
+        if (flags.captureAPI !== false) await captureAPIResponse(res, OUT);
       } catch (e) {}
     });
   };
@@ -8099,6 +8199,89 @@ ${stubFooter || ""}
       console.log(
         `     ⚠ url-map.json write failed: ${umErr.message?.slice(0, 60)}`,
       );
+    }
+
+    // v55 P2: persist API recordings + emit Vercel rewrites so the cloned
+    // SPA's XHR/fetch calls hit the saved responses instead of the live API.
+    if (apiRecordings.length > 0) {
+      try {
+        fs.writeFileSync(
+          path.join(OUT, "data", "api-recordings.json"),
+          JSON.stringify(apiRecordings, null, 2),
+        );
+        // Build Vercel rewrites. For each captured response, decide if the
+        // rewrite source should be the bare path (true API endpoint with no
+        // colliding HTML) or path + query-condition (RSC / .json/?action= /
+        // similar SPA-internal fetches that share a path with the page they
+        // load behind).
+        const rewrites = [];
+        const seenRules = new Set();
+        for (const r of apiRecordings) {
+          try {
+            const u = new URL(r.url);
+            if (u.pathname === "/") continue;
+            // Same-origin only — don't rewrite paths for analytics-CDN URLs.
+            if (u.origin !== PARSED.origin) continue;
+            // Does the clone have a static HTML file at this path? If yes,
+            // we must NOT rewrite the bare path or the static HTML disappears.
+            // Use a query-key `has` clause if the live fetch had a
+            // discriminator query (e.g. ?_rsc=..., ?action=..., ?ajax=1).
+            const localCandidates = [
+              path.join(OUT, u.pathname.replace(/^\//, ""), "index.html"),
+              path.join(OUT, u.pathname.replace(/^\//, "")),
+            ];
+            const hasStaticHTML = localCandidates.some((p) => {
+              try {
+                return fs.existsSync(p);
+              } catch {
+                return false;
+              }
+            });
+            const queryKeys = [...u.searchParams.keys()];
+            const dedupKey = `${u.pathname}|${queryKeys.sort().join(",")}`;
+            if (seenRules.has(dedupKey)) continue;
+            seenRules.add(dedupKey);
+            if (hasStaticHTML) {
+              if (queryKeys.length === 0) continue; // no discriminator — skip
+              // Match only when at least one of the captured query keys is
+              // present — distinguishes the API call from the page load.
+              rewrites.push({
+                source: u.pathname,
+                has: queryKeys.slice(0, 3).map((k) => ({
+                  type: "query",
+                  key: k,
+                })),
+                destination: r.savedPath,
+              });
+            } else {
+              rewrites.push({
+                source: u.pathname,
+                destination: r.savedPath,
+              });
+            }
+          } catch {}
+        }
+        const rewriteByPath = new Map(rewrites.map((r) => [r.source, r]));
+        // Merge with any existing vercel.json (cache headers already written
+        // earlier in the clone phase) so we don't overwrite them.
+        const vercelPath = path.join(OUT, "vercel.json");
+        let vercel = {};
+        if (fs.existsSync(vercelPath)) {
+          try {
+            vercel = JSON.parse(fs.readFileSync(vercelPath, "utf-8"));
+          } catch {}
+        }
+        vercel.rewrites = vercel.rewrites || [];
+        for (const r of rewrites) vercel.rewrites.push(r);
+        fs.writeFileSync(vercelPath, JSON.stringify(vercel, null, 2));
+        console.log(
+          `     📡 API: ${apiRecordings.length} responses captured (${rewriteByPath.size} rewrites in vercel.json)`,
+        );
+      } catch (apiErr) {
+        console.log(
+          `     ⚠ API recording write failed: ${apiErr.message?.slice(0, 60)}`,
+        );
+      }
     }
   } catch (mErr) {
     console.log(
