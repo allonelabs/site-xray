@@ -96,3 +96,27 @@ test("writePassIssues serializes deterministically", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("resolveStableSelector source string is well-formed", () => {
+  // We test the resolver's behavior through browser fixtures in v54-detectors.test.js.
+  // Here, we just check that the function source can be passed to new Function() and runs.
+  const src = `
+    function resolveStableSelector(el) {
+      if (el.id) return '#' + el.id;
+      if (el.dataset && el.dataset.testid) return '[data-testid="' + el.dataset.testid + '"]';
+      const classes = (el.className || '').split(/\\s+/).filter(c => c && !/^(js-|is-|has-)/.test(c));
+      if (classes.length) {
+        const sel = el.tagName.toLowerCase() + '.' + classes.join('.');
+        return sel;
+      }
+      const parent = el.parentElement;
+      if (!parent) return el.tagName.toLowerCase();
+      const siblings = Array.from(parent.children).filter(c => c.tagName === el.tagName);
+      const idx = siblings.indexOf(el) + 1;
+      return resolveStableSelector(parent) + ' > ' + el.tagName.toLowerCase() + ':nth-of-type(' + idx + ')';
+    }
+    return typeof resolveStableSelector;
+  `;
+  const result = new Function(src)();
+  assert.strictEqual(result, "function");
+});

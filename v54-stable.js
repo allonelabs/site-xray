@@ -292,6 +292,25 @@ function writePassIssues(outDir, passNum, issues) {
   );
 }
 
+// v54: Stable selector resolver — runs inside page.evaluate
+const RESOLVE_SELECTOR_SRC = `
+function resolveStableSelector(el) {
+  if (!el || el === document.body || el === document.documentElement) return el?.tagName?.toLowerCase() || 'body';
+  if (el.id) return '#' + CSS.escape(el.id);
+  if (el.dataset && el.dataset.testid) return '[data-testid="' + el.dataset.testid + '"]';
+  const classes = (typeof el.className === 'string' ? el.className : '').split(/\\s+/).filter(c => c && !/^(js-|is-|has-)/.test(c)).slice(0, 3);
+  if (classes.length) {
+    const sel = el.tagName.toLowerCase() + '.' + classes.map(c => CSS.escape(c)).join('.');
+    if (document.querySelectorAll(sel).length === 1) return sel;
+  }
+  const parent = el.parentElement;
+  if (!parent) return el.tagName.toLowerCase();
+  const siblings = Array.from(parent.children).filter(c => c.tagName === el.tagName);
+  const idx = siblings.indexOf(el) + 1;
+  return resolveStableSelector(parent) + ' > ' + el.tagName.toLowerCase() + ':nth-of-type(' + idx + ')';
+}
+`;
+
 function pathToFile(p) {
   p = p || "/";
   if (p.endsWith("/")) p += "index.html";
