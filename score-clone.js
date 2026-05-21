@@ -390,7 +390,29 @@ async function probeInteractive(origPage, clonePage) {
       return { missing: true };
     }
   };
-  for (const sel of candidates) {
+  // On nav-heavy sites the first click is often a navigate, which makes a
+  // single-sample score noisy. Reload both pages between candidates so each
+  // gets a fresh, comparable test. Cost: ~2-4s per extra reload.
+  const reloadBoth = async () => {
+    try {
+      await Promise.all([
+        origPage.goto(origPage.url(), {
+          waitUntil: "domcontentloaded",
+          timeout: 15000,
+        }),
+        clonePage.goto(clonePage.url(), {
+          waitUntil: "domcontentloaded",
+          timeout: 10000,
+        }),
+      ]);
+      await Promise.all([
+        origPage.waitForTimeout(800),
+        clonePage.waitForTimeout(800),
+      ]);
+    } catch {}
+  };
+  for (let idx = 0; idx < candidates.length; idx++) {
+    const sel = candidates[idx];
     const a = await safeClick(origPage, sel);
     const b = await safeClick(clonePage, sel);
     if (a.missing || b.missing) continue;
@@ -404,9 +426,16 @@ async function probeInteractive(origPage, clonePage) {
         clone: b.bucket,
         ok,
       });
-    // After a navigate, the next click on the same page would target a
-    // different DOM — stop on navigation so the run stays comparable.
-    if (a.bucket === "navigate" || b.bucket === "navigate") break;
+    // Either page navigated — reload both so the next candidate's selector
+    // resolves against the right document.
+    if (
+      a.bucket === "navigate" ||
+      b.bucket === "navigate" ||
+      a.navigated ||
+      b.navigated
+    ) {
+      if (idx < candidates.length - 1) await reloadBoth();
+    }
   }
   return {
     score: tested === 0 ? 100 : Math.round((matched / tested) * 100),
@@ -517,21 +546,40 @@ Output is printed to stdout. Pass --out to also write JSON.`);
       );
     await Promise.all([waitStable(origPage), waitStable(clonePage)]);
 
+    // Snapshot asset + error counters BEFORE probeInteractive starts. That
+    // probe reloads pages between candidates, which would double-count
+    // every load otherwise — penalizing clones whose every reload fetches
+    // the same uncached resources.
+    const snapshotCounter = (s) => ({
+      counts: { ...s.counts },
+      urls: s.urls.slice(),
+    });
+    const origAssetsSnap = snapshotCounter(origAssets);
+    const cloneAssetsSnap = snapshotCounter(cloneAssets);
+    const origErrorsSnap = {
+      count: origErrors.count,
+      samples: origErrors.samples.slice(),
+    };
+    const cloneErrorsSnap = {
+      count: cloneErrors.count,
+      samples: cloneErrors.samples.slice(),
+    };
+
     const visual = await probeVisual(origPage, clonePage);
     const structural = await probeStructural(origPage, clonePage);
     const interactive = await probeInteractive(origPage, clonePage);
 
     const errors = {
-      score: scoreErrors(origErrors, cloneErrors),
-      orig: origErrors,
-      clone: cloneErrors,
+      score: scoreErrors(origErrorsSnap, cloneErrorsSnap),
+      orig: origErrorsSnap,
+      clone: cloneErrorsSnap,
     };
-    const assetsResult = scoreAssets(origAssets, cloneAssets);
+    const assetsResult = scoreAssets(origAssetsSnap, cloneAssetsSnap);
     const assets = {
       score: assetsResult.score,
       perCategory: assetsResult.perCategory,
-      orig: origAssets,
-      clone: cloneAssets,
+      orig: origAssetsSnap,
+      clone: cloneAssetsSnap,
     };
 
     const overall = Math.round(
@@ -602,6 +650,49 @@ Output is printed to stdout. Pass --out to also write JSON.`);
           `    ${mark}  ${pad(s.orig, 12)} vs ${pad(s.clone, 12)}  ${s.sel}`,
         );
       }
+    }
+
+    // Actionable suggestions — surface the biggest concrete next step. These
+    // are heuristics, not gospel — but they point the user at the right
+    // file/flag/dimension.
+    const suggestions = [];
+    if (visual.score < 80)
+      suggestions.push(
+        `visual ${visual.score}: open data/original.png vs data/clone.png to spot the divergence (full-page diff ${(visual.ratio * 100).toFixed(0)}%).`,
+      );
+    if (interactive.score < 80 && interactive.tested > 0)
+      suggestions.push(
+        `interactive ${interactive.score}: ${interactive.tested - interactive.matched}/${interactive.tested} clicks behave differently. Re-run clone without --no-fix or check data/debug-report.html.`,
+      );
+    if (cloneErrorsSnap.count > origErrorsSnap.count + 2)
+      suggestions.push(
+        `errors: clone throws ${cloneErrorsSnap.count} console errors vs ${origErrorsSnap.count} on live. Sample: ${(cloneErrorsSnap.samples[0] || "").slice(0, 90)}`,
+      );
+    if (assets.score < 70) {
+      const weakCat = Object.entries(assets.perCategory).sort(
+        (a, b) => a[1] - b[1],
+      )[0];
+      if (weakCat)
+        suggestions.push(
+          `assets ${assets.score}: weakest category is "${weakCat[0]}" at ${weakCat[1]}/100 — orig has ${origAssetsSnap.counts[weakCat[0]] || 0}, clone has ${cloneAssetsSnap.counts[weakCat[0]] || 0}.`,
+        );
+    }
+    if (structural.score < 75) {
+      const weakPart = Object.entries(structural.breakdown).sort(
+        (a, b) => a[1] - b[1],
+      )[0];
+      if (weakPart)
+        suggestions.push(
+          `structural ${structural.score}: weakest part is "${weakPart[0]}" at ${weakPart[1]}/100 — orig ${structural.orig[weakPart[0]]}, clone ${structural.clone[weakPart[0]]}.`,
+        );
+    }
+    if (suggestions.length) {
+      console.log("");
+      console.log("  suggestions:");
+      for (const s of suggestions) console.log(`    ▸ ${s}`);
+    } else if (overall >= 90) {
+      console.log("");
+      console.log("  ✓ no major gaps — clone matches origin within tolerance");
     }
     console.log("");
 
