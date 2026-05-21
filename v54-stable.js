@@ -523,12 +523,18 @@ async function runVerifyPhase(outDir, browser, flags) {
     issues.push(...(await probeHover(origPage, clonePage, hoverCandidates)));
     issues.push(...(await auditForms(clonePage)));
     issues.push(...(await probeAnimationTrajectory(origPage, clonePage)));
-    issues.push(...(await probeAnimationFrames(origPage, clonePage)));
+    issues.push(...(await probeAnimationFrames(origPage, clonePage, outDir)));
     issues.push(...(await probeScrollCheckpoint(origPage, clonePage)));
     issues.push(...(await probeVisualDiff(origPage, clonePage, flags)));
     // probeConsoleAudit MUST be last: its reload tears down PIXEL_DIFF_SRC.
     issues.push(...(await probeConsoleAudit(origPage, clonePage)));
     const deduped = dedupAnimationIssues(issues);
+    // v54 E2: capture per-issue evidence screenshots (orig + clone bbox crops)
+    // for any issue with a selector. Animation frame captures are saved inside
+    // probeAnimationFrames itself, so this loop only handles bbox screenshots.
+    for (const issue of deduped) {
+      await captureEvidence(outDir, issue, origPage, clonePage);
+    }
     return {
       issues: deduped,
       origPage,
@@ -1027,7 +1033,7 @@ function trajectoryDistance(a, b) {
 // BOTH pages in parallel, then pixelDiff each frame pair (orig[i] vs clone[i]).
 // If >5% of frames have ratio > 0.02, emit a page-level visual-drift-animated
 // issue. Frames are captured at ~200ms intervals.
-async function probeAnimationFrames(origPage, clonePage) {
+async function probeAnimationFrames(origPage, clonePage, outDir) {
   const issues = [];
   const FRAME_COUNT = 25;
   const FRAME_INTERVAL_MS = 200;
@@ -1098,6 +1104,35 @@ async function probeAnimationFrames(origPage, clonePage) {
       fixAttempts: 0,
       resolvedInPass: null,
     });
+    // v54 E2: persist the 25 captured frames to disk for debug-report
+    // consumption. Frames are PNG Buffers from page.screenshot() (no `path`).
+    if (outDir) {
+      try {
+        const frameDir = path.join(
+          outDir,
+          "data",
+          "issues",
+          `${issueId("visual-drift-animated", null, { w: 1440, h: 900 })}-anim`,
+        );
+        fs.mkdirSync(frameDir, { recursive: true });
+        for (let i = 0; i < FRAME_COUNT; i++) {
+          if (origFrames[i]) {
+            fs.writeFileSync(
+              path.join(frameDir, `orig-${String(i).padStart(2, "0")}.png`),
+              origFrames[i],
+            );
+          }
+          if (cloneFrames[i]) {
+            fs.writeFileSync(
+              path.join(frameDir, `clone-${String(i).padStart(2, "0")}.png`),
+              cloneFrames[i],
+            );
+          }
+        }
+      } catch (e) {
+        logCaptureError("probeAnimationFrames:save-frames", e);
+      }
+    }
   }
   return issues;
 }
@@ -2086,6 +2121,53 @@ function dedupAnimationIssues(issues) {
     }
   }
   return [...passthrough, ...winners.values()];
+}
+
+// v54 E2: captureEvidence — for any issue with a selector, screenshot the
+// element's bounding box (with 16px padding) on both origPage and clonePage,
+// writing to outDir/data/issues/<id>-orig.png and <id>-clone.png. Updates
+// issue.evidence.screenshotOrig / screenshotClone to the relative paths.
+// Wrapped in try/catch via logCaptureError so a single bad selector cannot
+// abort the whole evidence pass.
+async function captureEvidence(outDir, issue, origPage, clonePage) {
+  const dir = path.join(outDir, "data", "issues");
+  fs.mkdirSync(dir, { recursive: true });
+  if (issue.selector) {
+    try {
+      const origEl = await origPage.$(issue.selector);
+      const cloneEl = await clonePage.$(issue.selector);
+      if (origEl) {
+        const box = await origEl.boundingBox();
+        if (box)
+          await origPage.screenshot({
+            path: path.join(dir, `${issue.id}-orig.png`),
+            clip: {
+              x: Math.max(0, box.x - 16),
+              y: Math.max(0, box.y - 16),
+              width: box.width + 32,
+              height: box.height + 32,
+            },
+          });
+        issue.evidence.screenshotOrig = `data/issues/${issue.id}-orig.png`;
+      }
+      if (cloneEl) {
+        const box = await cloneEl.boundingBox();
+        if (box)
+          await clonePage.screenshot({
+            path: path.join(dir, `${issue.id}-clone.png`),
+            clip: {
+              x: Math.max(0, box.x - 16),
+              y: Math.max(0, box.y - 16),
+              width: box.width + 32,
+              height: box.height + 32,
+            },
+          });
+        issue.evidence.screenshotClone = `data/issues/${issue.id}-clone.png`;
+      }
+    } catch (e) {
+      logCaptureError(`captureEvidence:${issue.id}`, e);
+    }
+  }
 }
 
 function pathToFile(p) {
