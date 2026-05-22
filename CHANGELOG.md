@@ -2,6 +2,61 @@
 
 Notable changes to Site X-Ray. See `git log v54-stable.js` for full per-commit history.
 
+## v55 — backend reverse engineering
+
+Closes the "clone looks right but breaks the moment you interact" gap. Static clones today are visually faithful but dead the moment an SPA tries to fetch its data or a visitor submits a form. v55 captures the **backend surface** during the Playwright clone and emits replay infrastructure.
+
+### P1 — keep-alive Agent pool (`xray-static.js`)
+
+- Memoized `http/https.Agent` per origin (`keepAlive:true`, `maxSockets:16`, `maxFreeSockets:8`).
+- TLS handshakes drop from once-per-fetch to ~5-10 per session.
+- Marginal wall-clock improvement on already-CDN-fronted sites (TLS session resumption was already cheap); meaningful resource hygiene improvement (fewer sockets, less ephemeral port churn).
+- Streaming asset writes via `stream.pipeline` were prototyped and reverted — the `createWriteStream + pipeline` setup cost (~20ms/file) dominated for small assets (the 95% case) and made the clone 5-8s **slower**.
+
+### P2 — API capture + Vercel replay (`v54-stable.js`)
+
+During Playwright clone, hook `page.on("response")` and record every XHR/fetch/eventsource response:
+
+- Save body to `data/api/<10-char-hash>.<ext>`
+- Append metadata to `data/api-recordings.json` (url, method, status, content-type, request body, sanitized request headers, byte count)
+- Emit Vercel rewrites in `vercel.json` so the deployed clone serves the saved blobs for matching paths
+
+Filters (defaults sensible):
+
+- `--no-capture-api` opts out
+- Analytics/tracking domains stripped
+- Skip 4xx/5xx (not useful to replay)
+- Skip > 5MB bodies (likely streaming endpoints)
+- Dedupe by `method+url+postData` hash
+- Hard cap 2000 recordings
+
+Rewrite intelligence: when a captured URL's pathname collides with a static HTML file in the clone (e.g. `/showcase?_rsc=...` and `/showcase/index.html`), the rewrite gets a `has:[{type:query, key:_rsc}]` discriminator so the static page is still served on the bare path.
+
+Benchmark (tailwindcss.com): 313 API responses captured (mostly React Server Component fetches), 73 rewrites generated.
+
+### P3 — form handler generation (`v54-stable.js`)
+
+Post-clone scan of every `*.html` for `<form method="POST" action="...">`. For each unique action path, generate a Vercel function at `api/<safe>.js` that:
+
+- Accepts POST only (405 on other methods)
+- Parses JSON or urlencoded body
+- Logs the submission (Vercel function logs visible)
+- Optionally forwards to Resend mail if `--form-email <to>` was passed (`RESEND_API_KEY` env on the deploy)
+- Returns 200 JSON `{ok:true, received:<body>}`
+
+Closes the "clone loses contact/signup/newsletter forms" gap.
+
+### Multi-page scoring (`score-pages.js` new)
+
+`score-clone.js` scored only the homepage. Real clones diverge across pages. `score-pages.js`:
+
+- Reads manifest.json's `pages` (or filesystem-walks for `index.html`)
+- Stratified-samples N pages (always includes the homepage)
+- Runs `score-clone` once per page
+- Emits per-page table + aggregate (mean, min, max)
+
+On Kenkais: homepage 94/100, /agency 87/100, /resources 96/100 → aggregate 92/100 (more honest than the single-page 94).
+
 ## xray-static (new engine)
 
 Adds `xray-static.js` — a Playwright-free HTTP-only clone engine for sites that ship full content in their HTML response (SSR Next.js, Astro, Hugo, WordPress, plain HTML).
