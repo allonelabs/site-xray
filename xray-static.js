@@ -148,7 +148,11 @@ async function fetchURL(url, opts = {}, redirects = 0) {
     const agent = getAgent(parsed.origin);
     const req = mod.get(
       url,
-      { headers: REQ_HEADERS, timeout: REQ_TIMEOUT_MS, agent },
+      {
+        headers: Object.assign({}, REQ_HEADERS, opts.headers || {}),
+        timeout: REQ_TIMEOUT_MS,
+        agent,
+      },
       (res) => {
         recordResponse(res.statusCode, null, host);
         if (
@@ -362,16 +366,13 @@ function localPathForAsset(absURL, kind, counters) {
   return `/${dir}/${filename}`;
 }
 
-async function downloadAll(absURLs, outDir, urlMap, kindByURL) {
+async function downloadAll(absURLs, outDir, urlMap, kindByURL, diffOpts) {
   let done = 0;
   let failed = 0;
+  let reused = 0; // v55 P6: counts files copied from prev clone via 304
+  const assetMeta = {}; // url → {savedPath, etag, lastModified, bytes}
   const queue = [...absURLs];
   const workers = [];
-  // Honor the (adaptive or forced) concurrency at LAUNCH time. If rate-
-  // limiting kicks in mid-download, in-flight workers each see the new
-  // rateState.spaceMs sleep via maybeSpace() on their next fetch. Workers
-  // started here keep running but each fetch is throttled. This is simpler
-  // than a dynamic worker count and good enough for adaptive behavior.
   const initialConcurrency = Math.max(1, effectiveConcurrency());
   for (let i = 0; i < initialConcurrency; i++) {
     workers.push(
@@ -387,19 +388,49 @@ async function downloadAll(absURLs, outDir, urlMap, kindByURL) {
             continue;
           }
           try {
-            // v55: keep-alive Agent already speeds up the socket layer.
-            // Buffer-and-write turned out to be faster than stream-pipe for
-            // the 95% case (small assets, 5-50KB) because the per-file
-            // createWriteStream + pipeline setup costs ~20ms each. For 591
-            // files that's 12s of overhead that exceeded the savings.
-            // Buffer everything; mem stays bounded by MAX_ASSET_BYTES.
-            const res = await fetchURL(u);
+            // v55 P6: if --diff mode and we have a prev manifest entry for
+            // this URL, send a conditional GET with prev's ETag. If the
+            // server returns 304, copy the file from the prev clone — no
+            // body downloaded. Falls back to a full fetch if prev lacked
+            // an ETag/Last-Modified or the response is 200.
+            const prev = diffOpts && diffOpts.prev ? diffOpts.prev[u] : null;
+            const condHeaders = {};
+            if (prev) {
+              if (prev.etag) condHeaders["If-None-Match"] = prev.etag;
+              else if (prev.lastModified)
+                condHeaders["If-Modified-Since"] = prev.lastModified;
+            }
+            const res = await fetchURL(u, { headers: condHeaders });
+            if (res.status === 304 && prev) {
+              const prevFile = path.join(
+                diffOpts.prevDir,
+                prev.savedPath.replace(/^\//, ""),
+              );
+              if (fs.existsSync(prevFile)) {
+                fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+                fs.copyFileSync(prevFile, fullPath);
+                assetMeta[u] = {
+                  savedPath: localPath,
+                  etag: prev.etag,
+                  lastModified: prev.lastModified,
+                  bytes: prev.bytes,
+                };
+                reused++;
+                continue;
+              }
+            }
             if (res.status >= 400) {
               failed++;
               continue;
             }
             fs.mkdirSync(path.dirname(fullPath), { recursive: true });
             fs.writeFileSync(fullPath, res.body);
+            assetMeta[u] = {
+              savedPath: localPath,
+              etag: res.headers && res.headers.etag,
+              lastModified: res.headers && res.headers["last-modified"],
+              bytes: res.body.length,
+            };
             // For CSS files, recursively extract url(...) refs and download
             if (kindByURL[u] === "css") {
               const cssText = res.body.toString("utf-8");
@@ -424,7 +455,7 @@ async function downloadAll(absURLs, outDir, urlMap, kindByURL) {
     );
   }
   await Promise.all(workers);
-  return { done, failed };
+  return { done, failed, reused, assetMeta };
 }
 
 function rewriteHTML(html, urlMap) {
@@ -864,20 +895,50 @@ async function main() {
       if (rateState.forced === 1) rateState.spaceMs = 250;
     }
   }
+  // --diff <prev-clone-dir>: re-clone using HTTP conditional fetches. For
+  // each asset, send If-None-Match with the prev clone's ETag (and/or
+  // If-Modified-Since); on 304, copy the file from the prev clone instead
+  // of downloading. Re-clones become much faster — and CDN-friendly.
+  const diffIdx = args.indexOf("--diff");
+  let diffPrev = null; // url → { savedPath, etag, lastModified }
+  let diffPrevDir = null;
+  if (diffIdx >= 0 && args[diffIdx + 1]) {
+    diffPrevDir = args[diffIdx + 1];
+    try {
+      const prevManifest = JSON.parse(
+        fs.readFileSync(
+          path.join(diffPrevDir, "data", "asset-manifest.json"),
+          "utf-8",
+        ),
+      );
+      diffPrev = Object.fromEntries(prevManifest.map((e) => [e.url, e]));
+    } catch (e) {
+      console.log(
+        `  ⚠ --diff: prev manifest not readable (${e.message?.slice(0, 60)}). Falling back to fresh clone.`,
+      );
+      diffPrev = null;
+    }
+  }
   const positional = args.filter(
-    (a, i) => !a.startsWith("--") && !(i > 0 && args[i - 1] === "--rate"),
+    (a, i) =>
+      !a.startsWith("--") &&
+      !(i > 0 && args[i - 1] === "--rate") &&
+      !(i > 0 && args[i - 1] === "--diff"),
   );
   if (positional.length < 1) {
     console.log(
       `xray-static — HTTP-only clone for static-rendered sites.
 
-Usage: node xray-static.js <url> [out-dir] [max-pages] [--force] [--rate <N>] [--validate]
+Usage: node xray-static.js <url> [out-dir] [max-pages] [--force] [--rate <N>] [--validate] [--diff <prev-dir>]
 
 Defaults: out-dir=/tmp/xray-static-<host>, max-pages=20.
 --force        Clone even if the site looks like a SPA shell.
 --rate <N>     Force concurrency (1 = serial w/ 250ms spacing, 12 = parallel).
                Without --rate the tool stays parallel and only downgrades to
                serial after detecting rate-limiting (429/503/403/timeouts).
+--diff <dir>   Re-clone using HTTP If-None-Match against the previous clone's
+               data/asset-manifest.json. Unchanged assets are copied locally
+               (no body download) — fast re-runs for monitor/watch use.
 --validate     HEAD-check each enumerated route before crawling; drop 4xx/5xx
                URLs. Catches dead sitemap entries / draft posts before we
                waste a full fetch on them.`,
@@ -979,9 +1040,14 @@ Defaults: out-dir=/tmp/xray-static-<host>, max-pages=20.
 
   // Step 3: download assets in parallel
   const assetURLs = Object.keys(urlMap);
-  console.log(`\n  ⬇️  downloading ${assetURLs.length} assets...`);
-  const dl = await downloadAll(assetURLs, outDir, urlMap, kindByURL);
-  console.log(`     ${dl.done} ok, ${dl.failed} failed`);
+  const diffOpts = diffPrev ? { prev: diffPrev, prevDir: diffPrevDir } : null;
+  console.log(
+    `\n  ⬇️  downloading ${assetURLs.length} assets${diffOpts ? " (diff mode — will copy unchanged from prev clone)" : ""}...`,
+  );
+  const dl = await downloadAll(assetURLs, outDir, urlMap, kindByURL, diffOpts);
+  console.log(
+    `     ${dl.done} ok, ${dl.failed} failed${dl.reused ? `, ${dl.reused} reused from prev` : ""}`,
+  );
 
   // Step 4: rewrite + write pages
   console.log(`\n  📝 rewriting + writing ${pages.length} pages...`);
@@ -1019,6 +1085,23 @@ Defaults: out-dir=/tmp/xray-static-<host>, max-pages=20.
     path.join(dataDir, "url-map.json"),
     JSON.stringify(urlMap, null, 2),
   );
+
+  // v55 P6: per-asset manifest with ETag/Last-Modified so future
+  // --diff <this-clone> runs can do conditional GETs and skip unchanged
+  // bytes via HTTP 304.
+  if (dl.assetMeta) {
+    const manifest = Object.entries(dl.assetMeta).map(([url, m]) => ({
+      url,
+      savedPath: m.savedPath,
+      etag: m.etag || null,
+      lastModified: m.lastModified || null,
+      bytes: m.bytes || 0,
+    }));
+    fs.writeFileSync(
+      path.join(dataDir, "asset-manifest.json"),
+      JSON.stringify(manifest, null, 2),
+    );
+  }
 
   const dt = ((Date.now() - t0) / 1000).toFixed(1);
   console.log(
