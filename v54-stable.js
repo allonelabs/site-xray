@@ -346,6 +346,79 @@ function scanFormsInClone(outDir) {
 // Vercel function template — Node serverless. Logs the submission and
 // returns 200 JSON. If formEmail is passed, posts to Resend (env var
 // RESEND_API_KEY must be set on the deployed project).
+// v55 P4: walk *.js in the clone and replace any exact-match captured API
+// URL with its local savedPath. Safe variant — no regex over minified
+// bundles, no substring rewriting. URLs that survive minification (most
+// `fetch("https://api...")` literals do) get replaced; URLs that were
+// constructed via concatenation are left alone. Idempotent: if a URL
+// isn't present in the file, nothing happens.
+function rewriteJSUrls(outDir, recordings) {
+  // Build a sorted list of (from → to) pairs. Longest URL first so a longer
+  // URL doesn't get partially-replaced by a shorter one with the same
+  // prefix. Filter to entries that have both a real URL and savedPath.
+  const replacements = recordings
+    .filter((r) => r.url && r.savedPath && r.url.length > 4)
+    .map((r) => [r.url, r.savedPath])
+    .sort((a, b) => b[0].length - a[0].length);
+  if (replacements.length === 0) return { files: 0, replacements: 0 };
+
+  const SKIP_DIRS = new Set([
+    "data",
+    "node_modules",
+    "images",
+    "fonts",
+    "videos",
+    "models",
+    "components",
+  ]);
+  let filesChanged = 0;
+  let totalReplacements = 0;
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        if (SKIP_DIRS.has(e.name) || e.name.startsWith(".")) continue;
+        walk(path.join(dir, e.name));
+      } else if (
+        e.isFile() &&
+        (e.name.endsWith(".js") || e.name.endsWith(".mjs"))
+      ) {
+        const fullPath = path.join(dir, e.name);
+        let content;
+        try {
+          content = fs.readFileSync(fullPath, "utf-8");
+        } catch {
+          continue;
+        }
+        let modified = content;
+        let countInFile = 0;
+        for (const [from, to] of replacements) {
+          if (!modified.includes(from)) continue;
+          const before = modified.length;
+          modified = modified.split(from).join(to);
+          // Number of replacements = (lengthDelta / (from-to length diff))
+          // but for our purposes count one per from-string was-present.
+          countInFile += 1;
+        }
+        if (countInFile > 0) {
+          try {
+            fs.writeFileSync(fullPath, modified);
+            filesChanged++;
+            totalReplacements += countInFile;
+          } catch {}
+        }
+      }
+    }
+  };
+  walk(outDir);
+  return { files: filesChanged, replacements: totalReplacements };
+}
+
 function writeFormHandler(outDir, form, formEmail) {
   const apiDir = path.join(outDir, "api");
   fs.mkdirSync(apiDir, { recursive: true });
@@ -8413,6 +8486,24 @@ ${stubFooter || ""}
         console.log(
           `     📡 API: ${apiRecordings.length} responses captured (${rewriteByPath.size} rewrites in vercel.json)`,
         );
+        // v55 P4: rewrite captured live URLs in cloned JS bundles → local
+        // savedPaths. Safe variant: exact-string match only (no regex on
+        // minified bundles). For sites whose JS hardcodes an absolute
+        // cross-origin API URL (e.g. fetch("https://api.live.com/posts")),
+        // this points it at the captured blob instead. Same-origin paths
+        // are already handled by the vercel.json rewrites above.
+        try {
+          const jsRewriteCount = rewriteJSUrls(OUT, apiRecordings);
+          if (jsRewriteCount.files > 0) {
+            console.log(
+              `     📜 JS rewrites: ${jsRewriteCount.replacements} URL replacements across ${jsRewriteCount.files} JS files`,
+            );
+          }
+        } catch (jsErr) {
+          console.log(
+            `     ⚠ JS URL rewrite failed: ${jsErr.message?.slice(0, 60)}`,
+          );
+        }
       } catch (apiErr) {
         console.log(
           `     ⚠ API recording write failed: ${apiErr.message?.slice(0, 60)}`,
