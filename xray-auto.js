@@ -182,10 +182,19 @@ Default engine is "auto": detects whether the site ships content in raw HTML
   });
   if (result.status !== 0) process.exit(result.status ?? 1);
 
-  // If the user asked for --score on the static engine, run score-clone now.
-  // v54 handles its own --score via runScorePhase, so we don't double-run.
+  const outDir = positional[1] || guessOutDirFromHostname(url);
+
+  // Always build a search index on top of the clone — works on both engines.
+  // Cheap (sub-second), useful, doesn't ship the index until the user
+  // wires it in (no HTML modified, just data/search-index.json + shim).
+  if (!cleanArgs.includes("--no-search")) {
+    const sIdx = path.join(SCRIPT_DIR, "xray-search-index.js");
+    spawnSync("node", [sIdx, outDir], { stdio: "inherit" });
+  }
+
+  // If --score, run score-clone after clone+index. v54 handles --score
+  // internally via runScorePhase; for the static engine we run it here.
   if (chosen === "static" && wantsScore) {
-    const outDir = positional[1] || guessOutDirFromHostname(url);
     const scoreScript = path.join(SCRIPT_DIR, "score-clone.js");
     const sc = spawnSync(
       "node",
